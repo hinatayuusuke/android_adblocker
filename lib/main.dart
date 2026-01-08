@@ -13,7 +13,7 @@ void main() {
 bool get _isAndroid => !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
 
 class _AdBlockerApp extends StatelessWidget {
-  const _AdBlockerApp({super.key});
+  const _AdBlockerApp({Key? key}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
