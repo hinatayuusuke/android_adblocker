@@ -36,18 +36,8 @@ Android AdBlocker is a Flutter-based Android app that blocks ads and trackers at
 2. Tap **Start** to request VPN permission and enable DNS filtering.
 3. Add domains to the allowlist to always permit them.
 
-## Blocklist
-The app ships with a small sample blocklist in `android/app/src/main/assets/blocklist.txt`. It supports hosts-style entries (e.g., `0.0.0.0 example.com`) and plain domains. You can expand or replace this list for your use case.
-
 ## Privacy
 The DNS filter runs locally on the device. DNS queries that are not blocked are forwarded to the upstream resolver (default: `1.1.1.1`). No telemetry or analytics are included.
-
-## Roadmap (Ideas)
-- TCP/53 support
-- IPv6 (AAAA) handling
-- CNAME chasing and caching
-- Blocklist updates and integrity checks
-- Private DNS detection and user guidance
 
 ## License
 MIT. See `LICENSE`.
