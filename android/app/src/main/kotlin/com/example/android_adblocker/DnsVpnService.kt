@@ -74,9 +74,8 @@ class DnsVpnService : VpnService() {
             .addRoute(DNS_SERVER, 32)
 
         val vpnInterface = builder.establish() ?: return
-        val blocklist = loadBlocklist()
         val allowlist = loadAllowlist()
-        val matcher = DomainRuleMatcher(blocklist, allowlist)
+        val matcher = DomainRuleMatcher(emptySet(), allowlist)
         val socket = DatagramSocket().apply {
             soTimeout = UPSTREAM_TIMEOUT_MS
         }
@@ -99,11 +98,19 @@ class DnsVpnService : VpnService() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
+        isRunning = true
+
         workerThread = Thread {
             runPacketLoop(vpnInterface, socket, matcher)
         }.apply { start() }
 
-        isRunning = true
+        // WHY: FGS開始猶予を超えないよう、重いブロックリスト読込は別スレッドで行う。
+        Thread {
+            val blocklist = loadBlocklist()
+            if (!stopSignal.get()) {
+                matcher.updateBlocklist(blocklist)
+            }
+        }.start()
     }
 
     private fun stopVpn() {
@@ -139,19 +146,30 @@ class DnsVpnService : VpnService() {
             matcher = matcher
         )
 
-        while (!stopSignal.get()) {
-            val length = try {
-                input.read(buffer)
-            } catch (error: IOException) {
-                Log.w(TAG, "VPN読み込み失敗: ${error.message}")
-                break
+        try {
+            while (!stopSignal.get()) {
+                val length = try {
+                    input.read(buffer)
+                } catch (error: IOException) {
+                    Log.w(TAG, "VPN読み込み失敗: ${error.message}")
+                    break
+                }
+                if (length < 0) {
+                    Log.w(TAG, "VPN読み込みが終了したため停止します。")
+                    break
+                }
+                if (length == 0) continue
+                val response = processor.handlePacket(buffer, length) ?: continue
+                try {
+                    output.write(response)
+                } catch (error: IOException) {
+                    Log.w(TAG, "VPN書き込み失敗: ${error.message}")
+                }
             }
-            if (length <= 0) continue
-            val response = processor.handlePacket(buffer, length) ?: continue
-            try {
-                output.write(response)
-            } catch (error: IOException) {
-                Log.w(TAG, "VPN書き込み失敗: ${error.message}")
+        } finally {
+            if (!stopSignal.get()) {
+                Log.w(TAG, "VPN処理が中断したためサービスを終了します。")
+                stopVpn()
             }
         }
     }
@@ -258,9 +276,13 @@ internal object VpnPreferences {
 }
 
 private class DomainRuleMatcher(
-    private val blocklist: Set<String>,
+    @Volatile private var blocklist: Set<String>,
     @Volatile private var allowlist: Set<String>
 ) {
+    fun updateBlocklist(newBlocklist: Set<String>) {
+        blocklist = newBlocklist
+    }
+
     fun updateAllowlist(newAllowlist: Set<String>) {
         allowlist = newAllowlist
     }
