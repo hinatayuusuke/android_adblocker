@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
@@ -90,7 +91,13 @@ class DnsVpnService : VpnService() {
         ruleMatcher = matcher
         stopSignal.set(false)
 
-        startForeground(NOTIFICATION_ID, buildNotification())
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // WHY: targetSdk 34+ ではFGS種別指定が必須のため。
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
 
         workerThread = Thread {
             runPacketLoop(vpnInterface, socket, matcher)

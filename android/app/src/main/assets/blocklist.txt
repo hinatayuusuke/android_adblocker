@@ -9,3 +9,4 @@
 0.0.0.0 ads.snapchat.com
 0.0.0.0 ads.tiktok.com
 0.0.0.0 ads.linkedin.com
+0.0.0.0 yahoo.co.jp

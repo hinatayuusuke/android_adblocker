@@ -7,7 +7,7 @@ import android.os.Bundle
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
@@ -17,7 +17,7 @@ import io.flutter.plugin.common.MethodChannel
  * 戻り値: なし。
  * 副作用: VPN権限の要求やサービス起動の結果をFlutterへ返す。
  */
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     private lateinit var permissionLauncher: ActivityResultLauncher<Intent>
     private var pendingResult: MethodChannel.Result? = null
 
