@@ -167,7 +167,7 @@ class DnsVpnService : VpnService() {
         val output = FileOutputStream(vpnInterface.fileDescriptor)
         val buffer = ByteArray(PACKET_BUFFER_SIZE)
         val processor = DnsPacketProcessor(
-            dnsServer = DNS_SERVER_BYTES,
+            dnsServer = DNS_SERVER_INT,
             matcher = matcher
         )
         // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
@@ -339,7 +339,7 @@ class DnsVpnService : VpnService() {
 
         private const val VPN_ADDRESS = "10.0.0.2"
         private const val DNS_SERVER = "10.0.0.1"
-        private val DNS_SERVER_BYTES = byteArrayOf(10, 0, 0, 1)
+        private const val DNS_SERVER_INT = 0x0A000001
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
         private const val UPSTREAM_WORKER_COUNT = 6
@@ -415,7 +415,7 @@ private class UpstreamResolver(
 }
 
 private class DnsPacketProcessor(
-    private val dnsServer: ByteArray,
+    private val dnsServer: Int,
     private val matcher: DomainRuleMatcher
 ) {
     sealed class Outcome {
@@ -438,9 +438,9 @@ private class DnsPacketProcessor(
         val protocol = packet[9].toInt() and 0xFF
         if (protocol != UDP_PROTOCOL) return null
 
-        val srcAddress = packet.copyOfRange(12, 16)
-        val destAddress = packet.copyOfRange(16, 20)
-        if (!destAddress.contentEquals(dnsServer)) return null
+        val srcAddress = readIpv4(packet, IPV4_SRC_ADDR_OFFSET)
+        val destAddress = readIpv4(packet, IPV4_DEST_ADDR_OFFSET)
+        if (destAddress != dnsServer) return null
 
         val srcPort = readU16(packet, headerLength)
         val destPort = readU16(packet, headerLength + 2)
@@ -452,8 +452,7 @@ private class DnsPacketProcessor(
         val dnsLength = min(length - dnsOffset, udpLength - UDP_HEADER_LEN)
         if (dnsLength <= 0) return null
 
-        val queryPayload = packet.copyOfRange(dnsOffset, dnsOffset + dnsLength)
-        val query = parseQuery(queryPayload) ?: return null
+        val query = parseQuery(packet, dnsOffset, dnsLength) ?: return null
         val normalized = query.domain.lowercase().trimEnd('.')
         val packetInfo = PacketInfo(
             srcAddress = srcAddress,
@@ -465,6 +464,7 @@ private class DnsPacketProcessor(
             val responsePayload = buildBlockedResponse(query)
             Outcome.Immediate(buildUdpResponse(packetInfo, responsePayload))
         } else {
+            val queryPayload = packet.copyOfRange(dnsOffset, dnsOffset + dnsLength)
             Outcome.Upstream(UpstreamJob(queryPayload, packetInfo, query))
         }
     }
@@ -482,8 +482,8 @@ private class DnsPacketProcessor(
         buffer[8] = 64
         buffer[9] = UDP_PROTOCOL.toByte()
 
-        System.arraycopy(packetInfo.destAddress, 0, buffer, 12, 4)
-        System.arraycopy(packetInfo.srcAddress, 0, buffer, 16, 4)
+        writeIpv4(buffer, IPV4_SRC_ADDR_OFFSET, packetInfo.destAddress)
+        writeIpv4(buffer, IPV4_DEST_ADDR_OFFSET, packetInfo.srcAddress)
         val checksum = ipv4Checksum(buffer, 0, IPV4_HEADER_MIN_LEN)
         writeU16(buffer, 10, checksum)
 
@@ -501,31 +501,32 @@ private class DnsPacketProcessor(
         return buildErrorResponse(query, DNS_RCODE_SERVFAIL)
     }
 
-    private fun parseQuery(payload: ByteArray): DnsQuery? {
-        if (payload.size < DNS_HEADER_LEN) return null
-        val id = readU16(payload, 0)
-        val flags = readU16(payload, 2)
-        val qdCount = readU16(payload, 4)
+    private fun parseQuery(packet: ByteArray, offset: Int, length: Int): DnsQuery? {
+        if (length < DNS_HEADER_LEN) return null
+        val end = offset + length
+        if (end > packet.size) return null
+        val id = readU16(packet, offset)
+        val flags = readU16(packet, offset + 2)
+        val qdCount = readU16(packet, offset + 4)
         if (qdCount < 1) return null
 
-        var index = DNS_HEADER_LEN
+        var index = offset + DNS_HEADER_LEN
         val labels = mutableListOf<String>()
-        val end = payload.size
         while (index < end) {
-            val labelLength = payload[index].toInt() and 0xFF
+            val labelLength = packet[index].toInt() and 0xFF
             if (labelLength == 0) {
                 index += 1
                 break
             }
             if ((labelLength and 0xC0) != 0) return null
             if (index + 1 + labelLength > end) return null
-            labels.add(String(payload, index + 1, labelLength, Charsets.UTF_8))
+            labels.add(String(packet, index + 1, labelLength, Charsets.UTF_8))
             index += 1 + labelLength
         }
 
         if (index + 4 > end) return null
         val questionEnd = index + 4
-        val question = payload.copyOfRange(DNS_HEADER_LEN, questionEnd)
+        val question = packet.copyOfRange(offset + DNS_HEADER_LEN, questionEnd)
         if (question.isEmpty()) return null
 
         return DnsQuery(
@@ -557,9 +558,23 @@ private class DnsPacketProcessor(
         return ((packet[offset].toInt() and 0xFF) shl 8) or (packet[offset + 1].toInt() and 0xFF)
     }
 
+    private fun readIpv4(packet: ByteArray, offset: Int): Int {
+        return ((packet[offset].toInt() and 0xFF) shl 24) or
+            ((packet[offset + 1].toInt() and 0xFF) shl 16) or
+            ((packet[offset + 2].toInt() and 0xFF) shl 8) or
+            (packet[offset + 3].toInt() and 0xFF)
+    }
+
     private fun writeU16(packet: ByteArray, offset: Int, value: Int) {
         packet[offset] = (value shr 8).toByte()
         packet[offset + 1] = value.toByte()
+    }
+
+    private fun writeIpv4(packet: ByteArray, offset: Int, address: Int) {
+        packet[offset] = (address shr 24).toByte()
+        packet[offset + 1] = (address shr 16).toByte()
+        packet[offset + 2] = (address shr 8).toByte()
+        packet[offset + 3] = address.toByte()
     }
 
     private fun ipv4Checksum(packet: ByteArray, offset: Int, length: Int): Int {
@@ -580,8 +595,8 @@ private class DnsPacketProcessor(
     }
 
     data class PacketInfo(
-        val srcAddress: ByteArray,
-        val destAddress: ByteArray,
+        val srcAddress: Int,
+        val destAddress: Int,
         val srcPort: Int,
         val destPort: Int
     )
@@ -595,6 +610,8 @@ private class DnsPacketProcessor(
 
     private companion object {
         const val IPV4_HEADER_MIN_LEN = 20
+        const val IPV4_SRC_ADDR_OFFSET = 12
+        const val IPV4_DEST_ADDR_OFFSET = 16
         const val UDP_HEADER_LEN = 8
         const val DNS_HEADER_LEN = 12
         const val DNS_PORT = 53
@@ -603,5 +620,3 @@ private class DnsPacketProcessor(
         const val DNS_RCODE_SERVFAIL = 0x0002
     }
 }
-
-
