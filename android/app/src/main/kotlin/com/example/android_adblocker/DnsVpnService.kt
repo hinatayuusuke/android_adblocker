@@ -215,14 +215,21 @@ class DnsVpnService : VpnService() {
         responseQueue: BlockingQueue<ByteArray>
     ) {
         responseWriter = Thread {
+            val batch = ArrayList<ByteArray>(RESPONSE_DRAIN_MAX)
             while (!stopSignal.get()) {
                 val response = try {
                     responseQueue.take()
                 } catch (_: InterruptedException) {
                     break
                 }
+                // WHY: ロック取得とwrite回数を減らすため、まとめて書き込む。
+                batch.clear()
+                batch.add(response)
+                responseQueue.drainTo(batch, RESPONSE_DRAIN_MAX - 1)
                 try {
-                    output.write(response)
+                    for (payload in batch) {
+                        output.write(payload)
+                    }
                 } catch (error: IOException) {
                     Log.w(TAG, "VPN書き込み失敗: ${error.message}")
                     break
@@ -345,6 +352,7 @@ class DnsVpnService : VpnService() {
         private const val UPSTREAM_WORKER_COUNT = 6
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
+        private const val RESPONSE_DRAIN_MAX = 32
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
 
