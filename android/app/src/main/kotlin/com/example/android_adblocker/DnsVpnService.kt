@@ -511,7 +511,7 @@ private class DnsPacketProcessor(
         if (qdCount < 1) return null
 
         var index = offset + DNS_HEADER_LEN
-        val labels = mutableListOf<String>()
+        val domainBuilder = StringBuilder()
         while (index < end) {
             val labelLength = packet[index].toInt() and 0xFF
             if (labelLength == 0) {
@@ -520,7 +520,10 @@ private class DnsPacketProcessor(
             }
             if ((labelLength and 0xC0) != 0) return null
             if (index + 1 + labelLength > end) return null
-            labels.add(decodeLabelLowercase(packet, index + 1, labelLength))
+            if (domainBuilder.isNotEmpty()) {
+                domainBuilder.append('.')
+            }
+            domainBuilder.append(decodeLabelLowercase(packet, index + 1, labelLength))
             index += 1 + labelLength
         }
 
@@ -533,7 +536,7 @@ private class DnsPacketProcessor(
             id = id,
             flags = flags,
             question = question,
-            domain = labels.joinToString(".")
+            domain = domainBuilder.toString()
         )
     }
 
