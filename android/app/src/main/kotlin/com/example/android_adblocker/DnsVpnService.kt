@@ -453,7 +453,7 @@ private class DnsPacketProcessor(
         if (dnsLength <= 0) return null
 
         val query = parseQuery(packet, dnsOffset, dnsLength) ?: return null
-        val normalized = query.domain.lowercase().trimEnd('.')
+        val normalized = query.domain
         val packetInfo = PacketInfo(
             srcAddress = srcAddress,
             destAddress = destAddress,
@@ -520,7 +520,7 @@ private class DnsPacketProcessor(
             }
             if ((labelLength and 0xC0) != 0) return null
             if (index + 1 + labelLength > end) return null
-            labels.add(String(packet, index + 1, labelLength, Charsets.UTF_8))
+            labels.add(decodeLabelLowercase(packet, index + 1, labelLength))
             index += 1 + labelLength
         }
 
@@ -556,6 +556,44 @@ private class DnsPacketProcessor(
 
     private fun readU16(packet: ByteArray, offset: Int): Int {
         return ((packet[offset].toInt() and 0xFF) shl 8) or (packet[offset + 1].toInt() and 0xFF)
+    }
+
+    private fun decodeLabelLowercase(packet: ByteArray, offset: Int, length: Int): String {
+        var hasNonAscii = false
+        for (i in 0 until length) {
+            if ((packet[offset + i].toInt() and 0x80) != 0) {
+                hasNonAscii = true
+                break
+            }
+        }
+        // WHY: ほとんどのDNSラベルはASCIIのため、UTF-8デコードを避けて割り当てを抑える。
+        if (!hasNonAscii) {
+            val chars = CharArray(length)
+            for (i in 0 until length) {
+                val value = packet[offset + i].toInt() and 0xFF
+                chars[i] = if (value in ASCII_UPPER_A..ASCII_UPPER_Z) {
+                    (value + ASCII_CASE_OFFSET).toChar()
+                } else {
+                    value.toChar()
+                }
+            }
+            return String(chars)
+        }
+        val label = String(packet, offset, length, Charsets.UTF_8)
+        var hasUpper = false
+        for (ch in label) {
+            if (ch in 'A'..'Z') {
+                hasUpper = true
+                break
+            }
+        }
+        if (!hasUpper) return label
+        val chars = CharArray(label.length)
+        for (i in label.indices) {
+            val ch = label[i]
+            chars[i] = if (ch in 'A'..'Z') (ch.code + ASCII_CASE_OFFSET).toChar() else ch
+        }
+        return String(chars)
     }
 
     private fun readIpv4(packet: ByteArray, offset: Int): Int {
@@ -618,5 +656,8 @@ private class DnsPacketProcessor(
         const val UDP_PROTOCOL = 17
         const val DNS_RCODE_NXDOMAIN = 0x0003
         const val DNS_RCODE_SERVFAIL = 0x0002
+        const val ASCII_UPPER_A = 0x41
+        const val ASCII_UPPER_Z = 0x5A
+        const val ASCII_CASE_OFFSET = 0x20
     }
 }
