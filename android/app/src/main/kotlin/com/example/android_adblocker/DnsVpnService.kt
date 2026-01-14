@@ -18,6 +18,8 @@ import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.BlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 
@@ -87,17 +89,26 @@ class DnsVpnService : VpnService() {
         val vpnInterface = builder.establish() ?: return
         val allowlist = loadAllowlist()
         val matcher = DomainRuleMatcher(emptySet(), allowlist)
-        val socket = DatagramSocket().apply {
-            soTimeout = UPSTREAM_TIMEOUT_MS
+        val sockets = mutableListOf<DatagramSocket>()
+        repeat(UPSTREAM_WORKER_COUNT) {
+            val socket = DatagramSocket().apply {
+                soTimeout = UPSTREAM_TIMEOUT_MS
+            }
+            if (!protect(socket)) {
+                socket.close()
+                sockets.forEach { it.close() }
+                vpnInterface.close()
+                return
+            }
+            sockets.add(socket)
         }
-        if (!protect(socket)) {
-            socket.close()
+        if (sockets.isEmpty()) {
             vpnInterface.close()
             return
         }
 
         vpnFd = vpnInterface
-        upstreamSocket = socket
+        upstreamSockets = sockets
         ruleMatcher = matcher
         stopSignal.set(false)
 
@@ -112,7 +123,7 @@ class DnsVpnService : VpnService() {
         isRunning = true
 
         workerThread = Thread {
-            runPacketLoop(vpnInterface, socket, matcher)
+            runPacketLoop(vpnInterface, sockets, matcher)
         }.apply { start() }
 
         // WHY: FGS開始猶予を超えないよう、重いブロックリスト読込は別スレッドで行う。
@@ -129,8 +140,12 @@ class DnsVpnService : VpnService() {
         stopSignal.set(true)
         workerThread?.interrupt()
         workerThread = null
-        upstreamSocket?.close()
-        upstreamSocket = null
+        responseWriter?.interrupt()
+        responseWriter = null
+        upstreamWorkers.forEach { it.interrupt() }
+        upstreamWorkers = emptyList()
+        upstreamSockets.forEach { it.close() }
+        upstreamSockets = emptyList()
         vpnFd?.close()
         vpnFd = null
         ruleMatcher = null
@@ -145,7 +160,7 @@ class DnsVpnService : VpnService() {
 
     private fun runPacketLoop(
         vpnInterface: ParcelFileDescriptor,
-        socket: DatagramSocket,
+        sockets: List<DatagramSocket>,
         matcher: DomainRuleMatcher
     ) {
         val input = FileInputStream(vpnInterface.fileDescriptor)
@@ -153,9 +168,13 @@ class DnsVpnService : VpnService() {
         val buffer = ByteArray(PACKET_BUFFER_SIZE)
         val processor = DnsPacketProcessor(
             dnsServer = DNS_SERVER_BYTES,
-            resolver = UpstreamResolver(socket, UPSTREAM_DNS),
             matcher = matcher
         )
+        // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
+        val requestQueue = ArrayBlockingQueue<DnsPacketProcessor.UpstreamJob>(UPSTREAM_QUEUE_CAPACITY)
+        val responseQueue = ArrayBlockingQueue<ByteArray>(RESPONSE_QUEUE_CAPACITY)
+        startResponseWriter(output, responseQueue)
+        startUpstreamWorkers(sockets, requestQueue, responseQueue, processor)
 
         try {
             while (!stopSignal.get()) {
@@ -170,11 +189,17 @@ class DnsVpnService : VpnService() {
                     break
                 }
                 if (length == 0) continue
-                val response = processor.handlePacket(buffer, length) ?: continue
-                try {
-                    output.write(response)
-                } catch (error: IOException) {
-                    Log.w(TAG, "VPN書き込み失敗: ${error.message}")
+                val outcome = processor.handlePacket(buffer, length) ?: continue
+                when (outcome) {
+                    is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
+                    is DnsPacketProcessor.Outcome.Upstream -> {
+                        if (!requestQueue.offer(outcome.job)) {
+                            // WHY: 読み取りスレッドを塞がないため、即時に失敗応答を返す。
+                            val responsePayload = processor.buildServfailResponse(outcome.job.query)
+                            val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
+                            enqueueResponse(responseQueue, response)
+                        }
+                    }
                 }
             }
         } finally {
@@ -182,6 +207,57 @@ class DnsVpnService : VpnService() {
                 Log.w(TAG, "VPN処理が中断したためサービスを終了します。")
                 stopVpn()
             }
+        }
+    }
+
+    private fun startResponseWriter(
+        output: FileOutputStream,
+        responseQueue: BlockingQueue<ByteArray>
+    ) {
+        responseWriter = Thread {
+            while (!stopSignal.get()) {
+                val response = try {
+                    responseQueue.take()
+                } catch (_: InterruptedException) {
+                    break
+                }
+                try {
+                    output.write(response)
+                } catch (error: IOException) {
+                    Log.w(TAG, "VPN書き込み失敗: ${error.message}")
+                    break
+                }
+            }
+        }.apply { start() }
+    }
+
+    private fun startUpstreamWorkers(
+        sockets: List<DatagramSocket>,
+        requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>,
+        responseQueue: BlockingQueue<ByteArray>,
+        processor: DnsPacketProcessor
+    ) {
+        upstreamWorkers = sockets.map { socket ->
+            Thread {
+                val resolver = UpstreamResolver(socket, UPSTREAM_DNS)
+                while (!stopSignal.get()) {
+                    val job = try {
+                        requestQueue.take()
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    val responsePayload = resolver.resolve(job.queryPayload)
+                        ?: processor.buildServfailResponse(job.query)
+                    val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
+                    enqueueResponse(responseQueue, response)
+                }
+            }.apply { start() }
+        }
+    }
+
+    private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
+        if (!queue.offer(response)) {
+            Log.w(TAG, "DNS応答キューが満杯のため破棄します。")
         }
     }
 
@@ -266,6 +342,9 @@ class DnsVpnService : VpnService() {
         private val DNS_SERVER_BYTES = byteArrayOf(10, 0, 0, 1)
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
+        private const val UPSTREAM_WORKER_COUNT = 6
+        private const val UPSTREAM_QUEUE_CAPACITY = 512
+        private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
 
@@ -275,8 +354,10 @@ class DnsVpnService : VpnService() {
     }
 
     private var vpnFd: ParcelFileDescriptor? = null
-    private var upstreamSocket: DatagramSocket? = null
     private var workerThread: Thread? = null
+    private var responseWriter: Thread? = null
+    private var upstreamWorkers: List<Thread> = emptyList()
+    private var upstreamSockets: List<DatagramSocket> = emptyList()
     private var ruleMatcher: DomainRuleMatcher? = null
     private val stopSignal = AtomicBoolean(false)
 }
@@ -335,10 +416,20 @@ private class UpstreamResolver(
 
 private class DnsPacketProcessor(
     private val dnsServer: ByteArray,
-    private val resolver: UpstreamResolver,
     private val matcher: DomainRuleMatcher
 ) {
-    fun handlePacket(packet: ByteArray, length: Int): ByteArray? {
+    sealed class Outcome {
+        data class Immediate(val response: ByteArray) : Outcome()
+        data class Upstream(val job: UpstreamJob) : Outcome()
+    }
+
+    data class UpstreamJob(
+        val queryPayload: ByteArray,
+        val packetInfo: PacketInfo,
+        val query: DnsQuery
+    )
+
+    fun handlePacket(packet: ByteArray, length: Int): Outcome? {
         if (length < IPV4_HEADER_MIN_LEN) return null
         val version = (packet[0].toInt() ushr 4) and 0x0F
         if (version != 4) return null
@@ -361,75 +452,24 @@ private class DnsPacketProcessor(
         val dnsLength = min(length - dnsOffset, udpLength - UDP_HEADER_LEN)
         if (dnsLength <= 0) return null
 
-        val query = parseQuery(packet, dnsOffset, dnsLength) ?: return null
+        val queryPayload = packet.copyOfRange(dnsOffset, dnsOffset + dnsLength)
+        val query = parseQuery(queryPayload) ?: return null
         val normalized = query.domain.lowercase().trimEnd('.')
-        val responsePayload = if (matcher.shouldBlock(normalized)) {
-            buildBlockedResponse(packet, query)
-        } else {
-            val queryPayload = packet.copyOfRange(dnsOffset, dnsOffset + dnsLength)
-            resolver.resolve(queryPayload) ?: return null
-        }
-
         val packetInfo = PacketInfo(
             srcAddress = srcAddress,
             destAddress = destAddress,
             srcPort = srcPort,
             destPort = destPort
         )
-        return buildUdpResponse(packetInfo, responsePayload)
-    }
-
-    private fun parseQuery(packet: ByteArray, offset: Int, length: Int): DnsQuery? {
-        if (length < DNS_HEADER_LEN) return null
-        val id = readU16(packet, offset)
-        val flags = readU16(packet, offset + 2)
-        val qdCount = readU16(packet, offset + 4)
-        if (qdCount < 1) return null
-
-        var index = offset + DNS_HEADER_LEN
-        val labels = mutableListOf<String>()
-        val end = offset + length
-        while (index < end) {
-            val labelLength = packet[index].toInt() and 0xFF
-            if (labelLength == 0) {
-                index += 1
-                break
-            }
-            if ((labelLength and 0xC0) != 0) return null
-            if (index + 1 + labelLength > end) return null
-            labels.add(String(packet, index + 1, labelLength, Charsets.UTF_8))
-            index += 1 + labelLength
+        return if (matcher.shouldBlock(normalized)) {
+            val responsePayload = buildBlockedResponse(query)
+            Outcome.Immediate(buildUdpResponse(packetInfo, responsePayload))
+        } else {
+            Outcome.Upstream(UpstreamJob(queryPayload, packetInfo, query))
         }
-
-        if (index + 4 > end) return null
-        val questionOffset = offset + DNS_HEADER_LEN
-        val questionEnd = index + 4
-        val questionLength = questionEnd - questionOffset
-        if (questionLength <= 0) return null
-
-        return DnsQuery(
-            id = id,
-            flags = flags,
-            questionOffset = questionOffset,
-            questionLength = questionLength,
-            domain = labels.joinToString(".")
-        )
     }
 
-    private fun buildBlockedResponse(packet: ByteArray, query: DnsQuery): ByteArray {
-        val response = ByteArray(DNS_HEADER_LEN + query.questionLength)
-        writeU16(response, 0, query.id)
-        val responseFlags = 0x8000 or (query.flags and 0x0100) or 0x0080 or DNS_RCODE_NXDOMAIN
-        writeU16(response, 2, responseFlags)
-        writeU16(response, 4, 1)
-        writeU16(response, 6, 0)
-        writeU16(response, 8, 0)
-        writeU16(response, 10, 0)
-        System.arraycopy(packet, query.questionOffset, response, DNS_HEADER_LEN, query.questionLength)
-        return response
-    }
-
-    private fun buildUdpResponse(packetInfo: PacketInfo, dnsPayload: ByteArray): ByteArray {
+    fun buildUdpResponse(packetInfo: PacketInfo, dnsPayload: ByteArray): ByteArray {
         val udpLength = UDP_HEADER_LEN + dnsPayload.size
         val totalLength = IPV4_HEADER_MIN_LEN + udpLength
         val buffer = ByteArray(totalLength)
@@ -455,6 +495,62 @@ private class DnsPacketProcessor(
         System.arraycopy(dnsPayload, 0, buffer, IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN, dnsPayload.size)
 
         return buffer
+    }
+
+    fun buildServfailResponse(query: DnsQuery): ByteArray {
+        return buildErrorResponse(query, DNS_RCODE_SERVFAIL)
+    }
+
+    private fun parseQuery(payload: ByteArray): DnsQuery? {
+        if (payload.size < DNS_HEADER_LEN) return null
+        val id = readU16(payload, 0)
+        val flags = readU16(payload, 2)
+        val qdCount = readU16(payload, 4)
+        if (qdCount < 1) return null
+
+        var index = DNS_HEADER_LEN
+        val labels = mutableListOf<String>()
+        val end = payload.size
+        while (index < end) {
+            val labelLength = payload[index].toInt() and 0xFF
+            if (labelLength == 0) {
+                index += 1
+                break
+            }
+            if ((labelLength and 0xC0) != 0) return null
+            if (index + 1 + labelLength > end) return null
+            labels.add(String(payload, index + 1, labelLength, Charsets.UTF_8))
+            index += 1 + labelLength
+        }
+
+        if (index + 4 > end) return null
+        val questionEnd = index + 4
+        val question = payload.copyOfRange(DNS_HEADER_LEN, questionEnd)
+        if (question.isEmpty()) return null
+
+        return DnsQuery(
+            id = id,
+            flags = flags,
+            question = question,
+            domain = labels.joinToString(".")
+        )
+    }
+
+    private fun buildBlockedResponse(query: DnsQuery): ByteArray {
+        return buildErrorResponse(query, DNS_RCODE_NXDOMAIN)
+    }
+
+    private fun buildErrorResponse(query: DnsQuery, rcode: Int): ByteArray {
+        val response = ByteArray(DNS_HEADER_LEN + query.question.size)
+        writeU16(response, 0, query.id)
+        val responseFlags = 0x8000 or (query.flags and 0x0100) or 0x0080 or rcode
+        writeU16(response, 2, responseFlags)
+        writeU16(response, 4, 1)
+        writeU16(response, 6, 0)
+        writeU16(response, 8, 0)
+        writeU16(response, 10, 0)
+        System.arraycopy(query.question, 0, response, DNS_HEADER_LEN, query.question.size)
+        return response
     }
 
     private fun readU16(packet: ByteArray, offset: Int): Int {
@@ -483,18 +579,17 @@ private class DnsPacketProcessor(
         return sum
     }
 
-    private data class PacketInfo(
+    data class PacketInfo(
         val srcAddress: ByteArray,
         val destAddress: ByteArray,
         val srcPort: Int,
         val destPort: Int
     )
 
-    private data class DnsQuery(
+    data class DnsQuery(
         val id: Int,
         val flags: Int,
-        val questionOffset: Int,
-        val questionLength: Int,
+        val question: ByteArray,
         val domain: String
     )
 
@@ -505,6 +600,7 @@ private class DnsPacketProcessor(
         const val DNS_PORT = 53
         const val UDP_PROTOCOL = 17
         const val DNS_RCODE_NXDOMAIN = 0x0003
+        const val DNS_RCODE_SERVFAIL = 0x0002
     }
 }
 
