@@ -376,31 +376,71 @@ internal object VpnPreferences {
 }
 
 private class DomainRuleMatcher(
-    @Volatile private var blocklist: Set<String>,
-    @Volatile private var allowlist: Set<String>
+    blocklist: Set<String>,
+    allowlist: Set<String>
 ) {
+    @Volatile
+    private var blocklistTrie = DomainSuffixTrie(blocklist)
+    @Volatile
+    private var allowlistTrie = DomainSuffixTrie(allowlist)
+
     fun updateBlocklist(newBlocklist: Set<String>) {
-        blocklist = newBlocklist
+        blocklistTrie = DomainSuffixTrie(newBlocklist)
     }
 
     fun updateAllowlist(newAllowlist: Set<String>) {
-        allowlist = newAllowlist
+        allowlistTrie = DomainSuffixTrie(newAllowlist)
     }
 
     fun shouldBlock(domain: String): Boolean {
         if (domain.isEmpty()) return false
-        if (matches(domain, allowlist)) return false
-        return matches(domain, blocklist)
+        if (allowlistTrie.matches(domain)) return false
+        return blocklistTrie.matches(domain)
+    }
+}
+
+private class DomainSuffixTrie(rules: Set<String>) {
+    private val root = Node()
+
+    init {
+        rules.forEach { rule -> addRule(rule) }
     }
 
-    private fun matches(domain: String, rules: Set<String>): Boolean {
-        var current = domain
-        while (true) {
-            if (rules.contains(current)) return true
-            val nextDot = current.indexOf('.')
-            if (nextDot == -1) return false
-            current = current.substring(nextDot + 1)
+    fun matches(domain: String): Boolean {
+        var node = root
+        var index = domain.length - 1
+        while (index >= 0) {
+            val next = node.children[domain[index]] ?: return false
+            node = next
+            index -= 1
+            if (node.isTerminal) {
+                // WHY: ラベル境界以外の一致は許可しないため、直前が'.'か終端のみ対象にする。
+                if (index < 0 || domain[index] == '.') return true
+            }
         }
+        return false
+    }
+
+    private fun addRule(rule: String) {
+        if (rule.isEmpty()) return
+        var node = root
+        for (index in rule.length - 1 downTo 0) {
+            val label = rule[index]
+            val next = node.children[label]
+            if (next == null) {
+                val created = Node()
+                node.children[label] = created
+                node = created
+            } else {
+                node = next
+            }
+        }
+        node.isTerminal = true
+    }
+
+    private class Node {
+        val children: MutableMap<Char, Node> = HashMap()
+        var isTerminal: Boolean = false
     }
 }
 
