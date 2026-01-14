@@ -65,6 +65,17 @@ class DnsVpnService : VpnService() {
         super.onDestroy()
     }
 
+    /**
+     * 目的: システムによりVPNが取り消された際に状態を整合させる。
+     * 引数: なし。
+     * 戻り値: なし。
+     * 副作用: VPNインタフェースとソケットを閉じ、サービスを停止する。
+     */
+    override fun onRevoke() {
+        stopVpn()
+        super.onRevoke()
+    }
+
     private fun startVpn() {
         if (isRunning) return
         val builder = Builder()
