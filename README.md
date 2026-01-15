@@ -16,10 +16,10 @@ Android AdBlocker is a Flutter-based Android app that blocks ads and trackers at
 - TCP/53 and IPv6 are not fully covered in the current MVP.
 
 ## Project Structure
-- `lib/main.dart` — Flutter UI and MethodChannel integration
-- `android/app/src/main/kotlin/com/example/android_adblocker/DnsVpnService.kt` — DNS-only VPN service
-- `android/app/src/main/kotlin/com/example/android_adblocker/MainActivity.kt` — MethodChannel bridge and VPN permission flow
-- `android/app/src/main/assets/blocklist.txt` — Sample blocklist
+- `lib/main.dart`  EFlutter UI and MethodChannel integration
+- `android/app/src/main/kotlin/com/example/android_adblocker/service/DnsVpnService.kt`  EDNS-only VPN service
+- `android/app/src/main/kotlin/com/example/android_adblocker/MainActivity.kt`  EMethodChannel bridge and VPN permission flow
+- `android/app/src/main/assets/blocklist.txt`  ESample blocklist
 
 ## Requirements
 - Flutter SDK (Dart 3.10+)
@@ -41,3 +41,4 @@ The DNS filter runs locally on the device. DNS queries that are not blocked are 
 
 ## License
 MIT. See `LICENSE`.
+
