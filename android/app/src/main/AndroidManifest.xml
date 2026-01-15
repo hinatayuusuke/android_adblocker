@@ -26,7 +26,7 @@
             </intent-filter>
         </activity>
         <service
-            android:name=".DnsVpnService"
+            android:name=".service.DnsVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:foregroundServiceType="specialUse">
