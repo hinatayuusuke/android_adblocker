@@ -7,6 +7,10 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -94,19 +98,7 @@ class DnsVpnService : VpnService() {
         val vpnInterface = builder.establish() ?: return
         val allowlist = loadAllowlist()
         val matcher = DomainRuleMatcher(emptySet(), allowlist)
-        val sockets = mutableListOf<DatagramSocket>()
-        repeat(UPSTREAM_WORKER_COUNT) {
-            val socket = DatagramSocket().apply {
-                soTimeout = UPSTREAM_TIMEOUT_MS
-            }
-            if (!protect(socket)) {
-                socket.close()
-                sockets.forEach { it.close() }
-                vpnInterface.close()
-                return
-            }
-            sockets.add(socket)
-        }
+        val sockets = createUpstreamSockets()
         if (sockets.isEmpty()) {
             vpnInterface.close()
             return
@@ -126,6 +118,7 @@ class DnsVpnService : VpnService() {
         }
 
         isRunning = true
+        startNetworkMonitor()
 
         workerThread = Thread {
             runPacketLoop(vpnInterface, sockets, matcher)
@@ -143,17 +136,20 @@ class DnsVpnService : VpnService() {
     private fun stopVpn() {
         if (!isRunning) return
         stopSignal.set(true)
+        stopNetworkMonitor()
         workerThread?.interrupt()
         workerThread = null
         responseWriter?.interrupt()
         responseWriter = null
-        upstreamWorkers.forEach { it.interrupt() }
-        upstreamWorkers = emptyList()
-        upstreamSockets.forEach { it.close() }
-        upstreamSockets = emptyList()
+        synchronized(upstreamResetLock) {
+            shutdownUpstreamLocked()
+        }
         vpnFd?.close()
         vpnFd = null
         ruleMatcher = null
+        processor = null
+        requestQueue = null
+        responseQueue = null
         stopForeground(true)
         isRunning = false
         stopSelf()
@@ -175,9 +171,12 @@ class DnsVpnService : VpnService() {
             dnsServer = DNS_SERVER_INT,
             matcher = matcher
         )
-        // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
+        this.processor = processor
+         // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
         val requestQueue = ArrayBlockingQueue<DnsPacketProcessor.UpstreamJob>(UPSTREAM_QUEUE_CAPACITY)
         val responseQueue = ArrayBlockingQueue<ByteArray>(RESPONSE_QUEUE_CAPACITY)
+        this.requestQueue = requestQueue
+        this.responseQueue = responseQueue
         startResponseWriter(output, responseQueue)
         startUpstreamWorkers(sockets, requestQueue, responseQueue, processor)
 
@@ -273,6 +272,82 @@ class DnsVpnService : VpnService() {
         }
     }
 
+    private fun startNetworkMonitor() {
+        val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                handleNetworkChange()
+            }
+
+            override fun onLost(network: Network) {
+                handleNetworkChange()
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                handleNetworkChange()
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            manager.registerDefaultNetworkCallback(callback)
+        } else {
+            manager.registerNetworkCallback(NetworkRequest.Builder().build(), callback)
+        }
+        connectivityManager = manager
+        networkCallback = callback
+    }
+
+    private fun stopNetworkMonitor() {
+        val manager = connectivityManager ?: return
+        val callback = networkCallback ?: return
+        try {
+            manager.unregisterNetworkCallback(callback)
+        } catch (_: IllegalArgumentException) {
+            // WHY: コールバックが登録されていない場合に発生する。
+        }
+        connectivityManager = null
+        networkCallback = null
+    }
+
+    private fun handleNetworkChange() {
+        if (!isRunning || stopSignal.get()) return
+        val currentProcessor = processor ?: return
+        val currentRequestQueue = requestQueue ?: return
+        val currentResponseQueue = responseQueue ?: return
+        synchronized(upstreamResetLock) {
+            if (!isRunning || stopSignal.get()) return
+            // WHY: 旧経路の滞留を残さず復旧後詰まりを減らす。
+            currentResponseQueue.clear()
+            shutdownUpstreamLocked()
+            val sockets = createUpstreamSockets()
+            if (sockets.isEmpty()) return
+            upstreamSockets = sockets
+            startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor)
+        }
+    }
+
+    private fun createUpstreamSockets(): List<DatagramSocket> {
+        val sockets = mutableListOf<DatagramSocket>()
+        repeat(UPSTREAM_WORKER_COUNT) {
+            val socket = DatagramSocket().apply {
+                soTimeout = UPSTREAM_TIMEOUT_MS
+            }
+            if (!protect(socket)) {
+                socket.close()
+                sockets.forEach { it.close() }
+                return emptyList()
+            }
+            sockets.add(socket)
+        }
+        return sockets
+    }
+
+    private fun shutdownUpstreamLocked() {
+        upstreamWorkers.forEach { it.interrupt() }
+        upstreamWorkers = emptyList()
+        upstreamSockets.forEach { it.close() }
+        upstreamSockets = emptyList()
+    }
+
     private fun buildNotification(): Notification {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -338,5 +413,11 @@ class DnsVpnService : VpnService() {
     private var upstreamWorkers: List<Thread> = emptyList()
     private var upstreamSockets: List<DatagramSocket> = emptyList()
     private var ruleMatcher: DomainRuleMatcher? = null
+    private var processor: DnsPacketProcessor? = null
+    private var requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>? = null
+    private var responseQueue: BlockingQueue<ByteArray>? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val upstreamResetLock = Any()
     private val stopSignal = AtomicBoolean(false)
 }
