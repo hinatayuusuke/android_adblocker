@@ -292,17 +292,21 @@ class DnsVpnService : VpnService() {
 
     private fun startNetworkMonitor() {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        currentNetwork = manager.activeNetwork
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                handleNetworkChange()
+                updateCurrentNetwork(network)
             }
 
             override fun onLost(network: Network) {
-                handleNetworkChange()
+                if (currentNetwork == network) {
+                    currentNetwork = null
+                    handleNetworkChange()
+                }
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                handleNetworkChange()
+                updateCurrentNetwork(network)
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -324,6 +328,14 @@ class DnsVpnService : VpnService() {
         }
         connectivityManager = null
         networkCallback = null
+        currentNetwork = null
+    }
+
+    private fun updateCurrentNetwork(network: Network) {
+        if (currentNetwork == network) return
+        // WHY: Avoid socket resets for capability-only updates (signal strength/bandwidth).
+        currentNetwork = network
+        handleNetworkChange()
     }
 
     private fun handleNetworkChange() {
@@ -438,6 +450,8 @@ class DnsVpnService : VpnService() {
     private var responseQueue: BlockingQueue<ByteArray>? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile
+    private var currentNetwork: Network? = null
     private val upstreamResetLock = Any()
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
