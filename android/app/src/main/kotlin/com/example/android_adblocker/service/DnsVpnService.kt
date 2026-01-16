@@ -7,11 +7,16 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.android_adblocker.BuildConfig
 import com.example.android_adblocker.MainActivity
 import com.example.android_adblocker.R
 import com.example.android_adblocker.core.DnsPacketProcessor
@@ -26,7 +31,9 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.BlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 目的: 端末内でDNSクエリのみを処理するVPNサービスを提供する。
@@ -94,19 +101,7 @@ class DnsVpnService : VpnService() {
         val vpnInterface = builder.establish() ?: return
         val allowlist = loadAllowlist()
         val matcher = DomainRuleMatcher(emptySet(), allowlist)
-        val sockets = mutableListOf<DatagramSocket>()
-        repeat(UPSTREAM_WORKER_COUNT) {
-            val socket = DatagramSocket().apply {
-                soTimeout = UPSTREAM_TIMEOUT_MS
-            }
-            if (!protect(socket)) {
-                socket.close()
-                sockets.forEach { it.close() }
-                vpnInterface.close()
-                return
-            }
-            sockets.add(socket)
-        }
+        val sockets = createUpstreamSockets()
         if (sockets.isEmpty()) {
             vpnInterface.close()
             return
@@ -126,6 +121,7 @@ class DnsVpnService : VpnService() {
         }
 
         isRunning = true
+        startNetworkMonitor()
 
         workerThread = Thread {
             runPacketLoop(vpnInterface, sockets, matcher)
@@ -143,17 +139,20 @@ class DnsVpnService : VpnService() {
     private fun stopVpn() {
         if (!isRunning) return
         stopSignal.set(true)
+        stopNetworkMonitor()
         workerThread?.interrupt()
         workerThread = null
         responseWriter?.interrupt()
         responseWriter = null
-        upstreamWorkers.forEach { it.interrupt() }
-        upstreamWorkers = emptyList()
-        upstreamSockets.forEach { it.close() }
-        upstreamSockets = emptyList()
+        synchronized(upstreamResetLock) {
+            shutdownUpstreamLocked()
+        }
         vpnFd?.close()
         vpnFd = null
         ruleMatcher = null
+        processor = null
+        requestQueue = null
+        responseQueue = null
         stopForeground(true)
         isRunning = false
         stopSelf()
@@ -175,9 +174,12 @@ class DnsVpnService : VpnService() {
             dnsServer = DNS_SERVER_INT,
             matcher = matcher
         )
-        // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
+        this.processor = processor
+         // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
         val requestQueue = ArrayBlockingQueue<DnsPacketProcessor.UpstreamJob>(UPSTREAM_QUEUE_CAPACITY)
         val responseQueue = ArrayBlockingQueue<ByteArray>(RESPONSE_QUEUE_CAPACITY)
+        this.requestQueue = requestQueue
+        this.responseQueue = responseQueue
         startResponseWriter(output, responseQueue)
         startUpstreamWorkers(sockets, requestQueue, responseQueue, processor)
 
@@ -198,11 +200,22 @@ class DnsVpnService : VpnService() {
                 when (outcome) {
                     is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
                     is DnsPacketProcessor.Outcome.Upstream -> {
-                        if (!requestQueue.offer(outcome.job)) {
+                        // WHY: 短時間待機の offer(timeout) を入れて、キュー満杯時の即SERVFAILを減らす
+                        val offered = try {
+                            requestQueue.offer(outcome.job, REQUEST_QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return
+                        }
+                        if (!offered) {
                             // WHY: 読み取りスレッドを塞がないため、即時に失敗応答を返す。
                             val responsePayload = processor.buildServfailResponse(outcome.job.query)
                             val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
                             enqueueResponse(responseQueue, response)
+                            val count = servfailCount.incrementAndGet()
+                            if (DEBUG_LOGS) {
+                                Log.d(TAG, "servfail fallback count=$count requestQueueSize=${requestQueue.size}")
+                            }
                         }
                     }
                 }
@@ -270,7 +283,87 @@ class DnsVpnService : VpnService() {
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
         if (!queue.offer(response)) {
             Log.w(TAG, "DNS応答キューが満杯のため破棄します。")
+            val count = responseDropCount.incrementAndGet()
+            if (DEBUG_LOGS) {
+                Log.d(TAG, "response drop count=$count responseQueueSize=${queue.size}")
+            }
         }
+    }
+
+    private fun startNetworkMonitor() {
+        val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                handleNetworkChange()
+            }
+
+            override fun onLost(network: Network) {
+                handleNetworkChange()
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                handleNetworkChange()
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            manager.registerDefaultNetworkCallback(callback)
+        } else {
+            manager.registerNetworkCallback(NetworkRequest.Builder().build(), callback)
+        }
+        connectivityManager = manager
+        networkCallback = callback
+    }
+
+    private fun stopNetworkMonitor() {
+        val manager = connectivityManager ?: return
+        val callback = networkCallback ?: return
+        try {
+            manager.unregisterNetworkCallback(callback)
+        } catch (_: IllegalArgumentException) {
+            // WHY: コールバックが登録されていない場合に発生する。
+        }
+        connectivityManager = null
+        networkCallback = null
+    }
+
+    private fun handleNetworkChange() {
+        if (!isRunning || stopSignal.get()) return
+        val currentProcessor = processor ?: return
+        val currentRequestQueue = requestQueue ?: return
+        val currentResponseQueue = responseQueue ?: return
+        synchronized(upstreamResetLock) {
+            if (!isRunning || stopSignal.get()) return
+            // WHY: 旧経路の滞留を残さず復旧後詰まりを減らす。
+            currentResponseQueue.clear()
+            shutdownUpstreamLocked()
+            val sockets = createUpstreamSockets()
+            if (sockets.isEmpty()) return
+            upstreamSockets = sockets
+            startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor)
+        }
+    }
+
+    private fun createUpstreamSockets(): List<DatagramSocket> {
+        val sockets = mutableListOf<DatagramSocket>()
+        repeat(UPSTREAM_WORKER_COUNT) {
+            val socket = DatagramSocket().apply {
+                soTimeout = UPSTREAM_TIMEOUT_MS
+            }
+            if (!protect(socket)) {
+                socket.close()
+                sockets.forEach { it.close() }
+                return emptyList()
+            }
+            sockets.add(socket)
+        }
+        return sockets
+    }
+
+    private fun shutdownUpstreamLocked() {
+        upstreamWorkers.forEach { it.interrupt() }
+        upstreamWorkers = emptyList()
+        upstreamSockets.forEach { it.close() }
+        upstreamSockets = emptyList()
     }
 
     private fun buildNotification(): Notification {
@@ -326,6 +419,8 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_DRAIN_MAX = 32
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
+        private const val REQUEST_QUEUE_WAIT_MS = 10L
+        private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
         var isRunning: Boolean = false
@@ -338,5 +433,13 @@ class DnsVpnService : VpnService() {
     private var upstreamWorkers: List<Thread> = emptyList()
     private var upstreamSockets: List<DatagramSocket> = emptyList()
     private var ruleMatcher: DomainRuleMatcher? = null
+    private var processor: DnsPacketProcessor? = null
+    private var requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>? = null
+    private var responseQueue: BlockingQueue<ByteArray>? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val upstreamResetLock = Any()
+    private val servfailCount = AtomicInteger(0)
+    private val responseDropCount = AtomicInteger(0)
     private val stopSignal = AtomicBoolean(false)
 }
