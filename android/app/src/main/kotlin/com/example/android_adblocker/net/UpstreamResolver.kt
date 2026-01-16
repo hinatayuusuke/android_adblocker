@@ -1,5 +1,7 @@
 package com.example.android_adblocker.net
 
+import android.util.Log
+import com.example.android_adblocker.BuildConfig
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -16,12 +18,25 @@ internal class UpstreamResolver(
 
     fun resolve(query: ByteArray): ByteArray? {
         return try {
+            val startNs = System.nanoTime()
             requestPacket.setData(query, 0, query.size)
             socket.send(requestPacket)
+            if (DEBUG_LOGS) {
+                Log.d(TAG, "upstream recv before length=${responsePacket.length}")
+            }
             socket.receive(responsePacket)
+            if (DEBUG_LOGS) {
+                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+                Log.d(TAG, "upstream recv after length=${responsePacket.length} elapsedMs=$elapsedMs")
+            }
             responseBuffer.copyOf(responsePacket.length)
         } catch (_: IOException) {
             null
         }
+    }
+
+    private companion object {
+        private const val TAG = "UpstreamResolver"
+        private val DEBUG_LOGS = BuildConfig.DEBUG
     }
 }

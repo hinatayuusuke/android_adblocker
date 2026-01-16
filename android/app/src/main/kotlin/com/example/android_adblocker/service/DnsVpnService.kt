@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.android_adblocker.BuildConfig
 import com.example.android_adblocker.MainActivity
 import com.example.android_adblocker.R
 import com.example.android_adblocker.core.DnsPacketProcessor
@@ -31,6 +32,7 @@ import java.net.InetSocketAddress
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.BlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 目的: 端末内でDNSクエリのみを処理するVPNサービスを提供する。
@@ -202,6 +204,10 @@ class DnsVpnService : VpnService() {
                             val responsePayload = processor.buildServfailResponse(outcome.job.query)
                             val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
                             enqueueResponse(responseQueue, response)
+                            val count = servfailCount.incrementAndGet()
+                            if (DEBUG_LOGS) {
+                                Log.d(TAG, "servfail fallback count=$count requestQueueSize=${requestQueue.size}")
+                            }
                         }
                     }
                 }
@@ -269,6 +275,10 @@ class DnsVpnService : VpnService() {
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
         if (!queue.offer(response)) {
             Log.w(TAG, "DNS応答キューが満杯のため破棄します。")
+            val count = responseDropCount.incrementAndGet()
+            if (DEBUG_LOGS) {
+                Log.d(TAG, "response drop count=$count responseQueueSize=${queue.size}")
+            }
         }
     }
 
@@ -401,6 +411,7 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_DRAIN_MAX = 32
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
+        private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
         var isRunning: Boolean = false
@@ -419,5 +430,7 @@ class DnsVpnService : VpnService() {
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val upstreamResetLock = Any()
+    private val servfailCount = AtomicInteger(0)
+    private val responseDropCount = AtomicInteger(0)
     private val stopSignal = AtomicBoolean(false)
 }
