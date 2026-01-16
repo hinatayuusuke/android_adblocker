@@ -24,6 +24,8 @@ internal class UpstreamResolver(
             if (DEBUG_LOGS) {
                 Log.d(TAG, "upstream recv before length=${responsePacket.length}")
             }
+            // WHY: 受信後に縮んだlengthを戻さないと応答が途中で切れる。
+            responsePacket.length = responseBuffer.size
             socket.receive(responsePacket)
             if (DEBUG_LOGS) {
                 val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
