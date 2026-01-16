@@ -31,6 +31,7 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.BlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -199,7 +200,14 @@ class DnsVpnService : VpnService() {
                 when (outcome) {
                     is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
                     is DnsPacketProcessor.Outcome.Upstream -> {
-                        if (!requestQueue.offer(outcome.job)) {
+                        // WHY: 短時間待機の offer(timeout) を入れて、キュー満杯時の即SERVFAILを減らす
+                        val offered = try {
+                            requestQueue.offer(outcome.job, REQUEST_QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            return
+                        }
+                        if (!offered) {
                             // WHY: 読み取りスレッドを塞がないため、即時に失敗応答を返す。
                             val responsePayload = processor.buildServfailResponse(outcome.job.query)
                             val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
@@ -411,6 +419,7 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_DRAIN_MAX = 32
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
+        private const val REQUEST_QUEUE_WAIT_MS = 10L
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
