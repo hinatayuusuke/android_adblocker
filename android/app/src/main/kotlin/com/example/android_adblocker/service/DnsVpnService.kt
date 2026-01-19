@@ -111,6 +111,8 @@ class DnsVpnService : VpnService() {
         upstreamSockets = sockets
         ruleMatcher = matcher
         stopSignal.set(false)
+        lastPacketAtMs = 0
+        pendingNetworkReset = false
 
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -139,6 +141,8 @@ class DnsVpnService : VpnService() {
     private fun stopVpn() {
         if (!isRunning) return
         stopSignal.set(true)
+        lastPacketAtMs = 0
+        pendingNetworkReset = false
         stopNetworkMonitor()
         workerThread?.interrupt()
         workerThread = null
@@ -196,6 +200,11 @@ class DnsVpnService : VpnService() {
                     break
                 }
                 if (length == 0) continue
+                lastPacketAtMs = System.currentTimeMillis()
+                if (pendingNetworkReset) {
+                    pendingNetworkReset = false
+                    handleNetworkChange()
+                }
                 val outcome = processor.handlePacket(buffer, length) ?: continue
                 when (outcome) {
                     is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
@@ -301,7 +310,7 @@ class DnsVpnService : VpnService() {
             override fun onLost(network: Network) {
                 if (currentNetwork == network) {
                     currentNetwork = null
-                    handleNetworkChange()
+                    scheduleNetworkReset()
                 }
             }
 
@@ -335,7 +344,22 @@ class DnsVpnService : VpnService() {
         if (currentNetwork == network) return
         // WHY: Avoid socket resets for capability-only updates (signal strength/bandwidth).
         currentNetwork = network
-        handleNetworkChange()
+        scheduleNetworkReset()
+    }
+
+    private fun scheduleNetworkReset() {
+        if (!isRunning || stopSignal.get()) return
+        val lastActiveAtMs = lastPacketAtMs
+        val nowMs = System.currentTimeMillis()
+        val isActive = lastActiveAtMs > 0 &&
+            (nowMs - lastActiveAtMs) <= NETWORK_IDLE_RESET_THRESHOLD_MS
+        if (isActive) {
+            pendingNetworkReset = false
+            handleNetworkChange()
+            return
+        }
+        // WHY: Defer socket resets while idle to avoid waking workers on churn.
+        pendingNetworkReset = true
     }
 
     private fun handleNetworkChange() {
@@ -432,6 +456,7 @@ class DnsVpnService : VpnService() {
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
         private const val REQUEST_QUEUE_WAIT_MS = 10L
+        private const val NETWORK_IDLE_RESET_THRESHOLD_MS = 5000L
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
@@ -452,6 +477,10 @@ class DnsVpnService : VpnService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile
     private var currentNetwork: Network? = null
+    @Volatile
+    private var lastPacketAtMs: Long = 0
+    @Volatile
+    private var pendingNetworkReset: Boolean = false
     private val upstreamResetLock = Any()
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
