@@ -111,7 +111,9 @@ class DnsVpnService : VpnService() {
         upstreamSockets = sockets
         ruleMatcher = matcher
         stopSignal.set(false)
+        fatalStopRequested = false
         lastPacketAtMs = 0
+        lastResponseWriteAtMs = 0
         pendingNetworkReset = false
 
         val notification = buildNotification()
@@ -148,6 +150,8 @@ class DnsVpnService : VpnService() {
         workerThread = null
         responseWriter?.interrupt()
         responseWriter = null
+        responseWatchdog?.interrupt()
+        responseWatchdog = null
         synchronized(upstreamResetLock) {
             shutdownUpstreamLocked()
         }
@@ -157,6 +161,8 @@ class DnsVpnService : VpnService() {
         processor = null
         requestQueue = null
         responseQueue = null
+        lastResponseWriteAtMs = 0
+        fatalStopRequested = false
         stopForeground(true)
         isRunning = false
         stopSelf()
@@ -185,6 +191,7 @@ class DnsVpnService : VpnService() {
         this.requestQueue = requestQueue
         this.responseQueue = responseQueue
         startResponseWriter(output, responseQueue)
+        startResponseWatchdog()
         startUpstreamWorkers(sockets, requestQueue, responseQueue, processor)
 
         try {
@@ -230,7 +237,7 @@ class DnsVpnService : VpnService() {
                 }
             }
         } finally {
-            if (!stopSignal.get()) {
+            if (!stopSignal.get() || fatalStopRequested) {
                 Log.w(TAG, "VPN処理が中断したためサービスを終了します。")
                 stopVpn()
             }
@@ -241,6 +248,7 @@ class DnsVpnService : VpnService() {
         output: FileOutputStream,
         responseQueue: BlockingQueue<ByteArray>
     ) {
+        lastResponseWriteAtMs = System.currentTimeMillis()
         responseWriter = Thread {
             val batch = ArrayList<ByteArray>(RESPONSE_DRAIN_MAX)
             while (!stopSignal.get()) {
@@ -256,10 +264,43 @@ class DnsVpnService : VpnService() {
                 try {
                     for (payload in batch) {
                         output.write(payload)
+                        lastResponseWriteAtMs = System.currentTimeMillis()
                     }
                 } catch (error: IOException) {
-                    Log.w(TAG, "VPN書き込み失敗: ${error.message}")
+                    if (!stopSignal.get()) {
+                        requestFatalStop("VPN書き込み失敗: ${error.message}", error)
+                    }
                     break
+                }
+            }
+        }.apply { start() }
+    }
+
+    private fun startResponseWatchdog() {
+        responseWatchdog = Thread {
+            while (!stopSignal.get()) {
+                try {
+                    Thread.sleep(RESPONSE_WATCHDOG_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                if (!isRunning || stopSignal.get()) break
+                val writer = responseWriter
+                if (writer == null || !writer.isAlive) {
+                    requestFatalStop("responseWriter thread is not alive")
+                    break
+                }
+                val queue = responseQueue
+                // WHY: Only trip when responses are pending to avoid idle false positives.
+                if (queue != null && queue.isNotEmpty()) {
+                    val lastWriteAtMs = lastResponseWriteAtMs
+                    val nowMs = System.currentTimeMillis()
+                    if (lastWriteAtMs > 0 && nowMs - lastWriteAtMs >= RESPONSE_WRITE_STALL_MS) {
+                        requestFatalStop(
+                            "responseWriter stalled for ${nowMs - lastWriteAtMs}ms with pending responses"
+                        )
+                        break
+                    }
                 }
             }
         }.apply { start() }
@@ -435,6 +476,28 @@ class DnsVpnService : VpnService() {
         return prefs.getStringSet(VpnPreferences.KEY_ALLOWLIST, emptySet())?.toSet() ?: emptySet()
     }
 
+    private fun requestFatalStop(reason: String, error: Throwable? = null) {
+        if (!isRunning) return
+        if (error == null) {
+            Log.w(TAG, reason)
+        } else {
+            Log.w(TAG, reason, error)
+        }
+        // WHY: Ensure the read loop observes a fatal stop after responseWriter failures.
+        fatalStopRequested = true
+        stopSignal.set(true)
+        try {
+            vpnFd?.close()
+        } catch (closeError: IOException) {
+            Log.w(TAG, "VPN fd close failed after $reason: ${closeError.message}")
+        }
+        workerThread?.interrupt()
+        val worker = workerThread
+        if (worker == null || !worker.isAlive) {
+            stopVpn()
+        }
+    }
+
     companion object {
         const val ACTION_START = "com.example.android_adblocker.action.START"
         const val ACTION_STOP = "com.example.android_adblocker.action.STOP"
@@ -453,6 +516,8 @@ class DnsVpnService : VpnService() {
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
+        private const val RESPONSE_WATCHDOG_INTERVAL_MS = 2000L
+        private const val RESPONSE_WRITE_STALL_MS = 10000L
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
         private const val REQUEST_QUEUE_WAIT_MS = 10L
@@ -467,6 +532,7 @@ class DnsVpnService : VpnService() {
     private var vpnFd: ParcelFileDescriptor? = null
     private var workerThread: Thread? = null
     private var responseWriter: Thread? = null
+    private var responseWatchdog: Thread? = null
     private var upstreamWorkers: List<Thread> = emptyList()
     private var upstreamSockets: List<DatagramSocket> = emptyList()
     private var ruleMatcher: DomainRuleMatcher? = null
@@ -480,7 +546,11 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var lastPacketAtMs: Long = 0
     @Volatile
+    private var lastResponseWriteAtMs: Long = 0
+    @Volatile
     private var pendingNetworkReset: Boolean = false
+    @Volatile
+    private var fatalStopRequested: Boolean = false
     private val upstreamResetLock = Any()
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
