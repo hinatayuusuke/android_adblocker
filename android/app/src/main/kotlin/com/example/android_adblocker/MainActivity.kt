@@ -52,6 +52,16 @@ class MainActivity : FlutterFragmentActivity() {
                 when (call.method) {
                     "prepareVpn" -> handlePrepare(result)
                     "startVpn" -> {
+                        val remainingMs = DnsVpnService.cooldownRemainingMs(System.currentTimeMillis())
+                        if (remainingMs > 0) {
+                            val seconds = (remainingMs / 1000).coerceAtLeast(1)
+                            result.error(
+                                "cooldown",
+                                "再起動クールダウン中です。${seconds}秒後に再試行してください。",
+                                mapOf("remainingMs" to remainingMs)
+                            )
+                            return@setMethodCallHandler
+                        }
                         startVpnService(DnsVpnService.ACTION_START)
                         result.success(true)
                     }

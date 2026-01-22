@@ -14,6 +14,7 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.android_adblocker.BuildConfig
@@ -93,10 +94,10 @@ class DnsVpnService : VpnService() {
     private fun startVpn() {
         if (isRunning) return
         val nowMs = System.currentTimeMillis()
-        if (nowMs < restartAllowedAtMs) {
-            val delayMs = restartAllowedAtMs - nowMs
+        val remainingMs = cooldownRemainingMs(nowMs)
+        if (remainingMs > 0) {
             // WHY: Cooldown prevents rapid restart loops from starving the UI thread.
-            Log.w(TAG, "VPN restart cooldown active (${delayMs}ms remaining, lastFatalStopAtMs=$lastFatalStopAtMs)")
+            Log.w(TAG, "VPN restart cooldown active (${remainingMs}ms remaining, lastFatalStopAtMs=$lastFatalStopAtMs)")
             stopSelf()
             return
         }
@@ -109,8 +110,10 @@ class DnsVpnService : VpnService() {
         val vpnInterface = builder.establish() ?: return
         val allowlist = loadAllowlist()
         val matcher = DomainRuleMatcher(emptySet(), allowlist)
-        val sockets = createUpstreamSockets()
+        startNetworkMonitor()
+        val sockets = createUpstreamSockets(currentNetwork)
         if (sockets.isEmpty()) {
+            stopNetworkMonitor()
             vpnInterface.close()
             return
         }
@@ -133,7 +136,6 @@ class DnsVpnService : VpnService() {
         }
 
         isRunning = true
-        startNetworkMonitor()
 
         workerThread = Thread {
             runPacketLoop(vpnInterface, sockets, matcher)
@@ -154,11 +156,17 @@ class DnsVpnService : VpnService() {
         lastPacketAtMs = 0
         pendingNetworkReset = false
         stopNetworkMonitor()
-        workerThread?.interrupt()
+        val worker = workerThread
+        worker?.interrupt()
+        joinThread(worker, "packetLoop")
         workerThread = null
-        responseWriter?.interrupt()
+        val writer = responseWriter
+        writer?.interrupt()
+        joinThread(writer, "responseWriter")
         responseWriter = null
-        responseWatchdog?.interrupt()
+        val watchdog = responseWatchdog
+        watchdog?.interrupt()
+        joinThread(watchdog, "responseWatchdog")
         responseWatchdog = null
         synchronized(upstreamResetLock) {
             shutdownUpstreamLocked()
@@ -363,10 +371,12 @@ class DnsVpnService : VpnService() {
         currentNetwork = manager.activeNetwork
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                lastNetworkAvailableAtMs = System.currentTimeMillis()
                 updateCurrentNetwork(network)
             }
 
             override fun onLost(network: Network) {
+                lastNetworkLostAtMs = System.currentTimeMillis()
                 if (currentNetwork == network) {
                     currentNetwork = null
                     scheduleNetworkReset()
@@ -397,6 +407,8 @@ class DnsVpnService : VpnService() {
         connectivityManager = null
         networkCallback = null
         currentNetwork = null
+        lastNetworkAvailableAtMs = 0
+        lastNetworkLostAtMs = 0
     }
 
     private fun updateCurrentNetwork(network: Network) {
@@ -426,19 +438,24 @@ class DnsVpnService : VpnService() {
         val currentProcessor = processor ?: return
         val currentRequestQueue = requestQueue ?: return
         val currentResponseQueue = responseQueue ?: return
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "Network change detected. Resetting upstream. currentNetwork=$currentNetwork")
+        }
         synchronized(upstreamResetLock) {
             if (!isRunning || stopSignal.get()) return
             // WHY: 旧経路の滞留を残さず復旧後詰まりを減らす。
             currentResponseQueue.clear()
+            // WHY: Stale requests after network switches are likely obsolete; drop to reduce latency.
+            currentRequestQueue.clear()
             shutdownUpstreamLocked()
-            val sockets = createUpstreamSockets()
+            val sockets = createUpstreamSockets(currentNetwork)
             if (sockets.isEmpty()) return
             upstreamSockets = sockets
             startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor)
         }
     }
 
-    private fun createUpstreamSockets(): List<DatagramSocket> {
+    private fun createUpstreamSockets(network: Network?): List<DatagramSocket> {
         val sockets = mutableListOf<DatagramSocket>()
         repeat(UPSTREAM_WORKER_COUNT) {
             val socket = DatagramSocket().apply {
@@ -449,16 +466,48 @@ class DnsVpnService : VpnService() {
                 sockets.forEach { it.close() }
                 return emptyList()
             }
+            if (network != null) {
+                try {
+                    network.bindSocket(socket)
+                    if (DEBUG_LOGS) {
+                        Log.d(TAG, "Bound upstream socket to network=$network")
+                    }
+                } catch (error: Exception) {
+                    Log.w(TAG, "Failed to bind upstream socket to network: ${error.message}")
+                }
+            } else if (DEBUG_LOGS) {
+                Log.d(TAG, "Upstream socket created without network binding")
+            }
             sockets.add(socket)
+        }
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "Upstream sockets created count=${sockets.size} network=$network")
         }
         return sockets
     }
 
     private fun shutdownUpstreamLocked() {
-        upstreamWorkers.forEach { it.interrupt() }
+        val workers = upstreamWorkers
         upstreamWorkers = emptyList()
+        workers.forEach { it.interrupt() }
         upstreamSockets.forEach { it.close() }
         upstreamSockets = emptyList()
+        workers.forEachIndexed { index, worker ->
+            joinThread(worker, "upstreamWorker#$index")
+        }
+    }
+
+    private fun joinThread(thread: Thread?, label: String) {
+        if (thread == null || thread === Thread.currentThread()) return
+        try {
+            thread.join(THREAD_JOIN_TIMEOUT_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return
+        }
+        if (thread.isAlive) {
+            Log.w(TAG, "$label thread did not stop within ${THREAD_JOIN_TIMEOUT_MS}ms state=${thread.state}")
+        }
     }
 
     private fun buildNotification(): Notification {
@@ -505,6 +554,30 @@ class DnsVpnService : VpnService() {
         val nowMs = System.currentTimeMillis()
         lastFatalStopAtMs = nowMs
         restartAllowedAtMs = nowMs + FATAL_RESTART_COOLDOWN_MS
+        val responseQueueSize = responseQueue?.size ?: -1
+        val requestQueueSize = requestQueue?.size ?: -1
+        val lastPacketDeltaMs = if (lastPacketAtMs > 0) nowMs - lastPacketAtMs else -1
+        val lastWriteDeltaMs = if (lastResponseWriteAtMs > 0) nowMs - lastResponseWriteAtMs else -1
+        val lastAvailableDeltaMs = if (lastNetworkAvailableAtMs > 0) nowMs - lastNetworkAvailableAtMs else -1
+        val lastLostDeltaMs = if (lastNetworkLostAtMs > 0) nowMs - lastNetworkLostAtMs else -1
+        val writerState = responseWriter?.state?.name ?: "null"
+        val networkPresent = currentNetwork != null
+        val errorType = error?.javaClass?.simpleName ?: "none"
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val isPowerSave = powerManager.isPowerSaveMode
+        val isIdle = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            powerManager.isDeviceIdleMode
+        } else {
+            false
+        }
+        Log.w(
+            TAG,
+            "fatal stop detail reason=$reason errorType=$errorType responseQueueSize=$responseQueueSize " +
+                "requestQueueSize=$requestQueueSize lastPacketDeltaMs=$lastPacketDeltaMs " +
+                "lastWriteDeltaMs=$lastWriteDeltaMs writerState=$writerState " +
+                "currentNetworkPresent=$networkPresent lastOnAvailableDeltaMs=$lastAvailableDeltaMs " +
+                "lastOnLostDeltaMs=$lastLostDeltaMs powerSave=$isPowerSave idle=$isIdle"
+        )
         // WHY: Ensure the read loop observes a fatal stop after responseWriter failures.
         fatalStopRequested = true
         stopSignal.set(true)
@@ -541,6 +614,7 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_WATCHDOG_INTERVAL_MS = 2000L
         private const val RESPONSE_WRITE_STALL_MS = 15000L
         private const val RESPONSE_WATCHDOG_MAX_MISSES = 3
+        private const val THREAD_JOIN_TIMEOUT_MS = 500L
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
         private const val REQUEST_QUEUE_WAIT_MS = 10L
@@ -551,6 +625,18 @@ class DnsVpnService : VpnService() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        @Volatile
+        var lastFatalStopAtMs: Long = 0
+
+        @Volatile
+        var restartAllowedAtMs: Long = 0
+
+        @JvmStatic
+        fun cooldownRemainingMs(nowMs: Long): Long {
+            val remainingMs = restartAllowedAtMs - nowMs
+            return if (remainingMs > 0) remainingMs else 0
+        }
     }
 
     private var vpnFd: ParcelFileDescriptor? = null
@@ -568,13 +654,13 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var currentNetwork: Network? = null
     @Volatile
+    private var lastNetworkAvailableAtMs: Long = 0
+    @Volatile
+    private var lastNetworkLostAtMs: Long = 0
+    @Volatile
     private var lastPacketAtMs: Long = 0
     @Volatile
     private var lastResponseWriteAtMs: Long = 0
-    @Volatile
-    private var lastFatalStopAtMs: Long = 0
-    @Volatile
-    private var restartAllowedAtMs: Long = 0
     @Volatile
     private var pendingNetworkReset: Boolean = false
     @Volatile
