@@ -92,6 +92,14 @@ class DnsVpnService : VpnService() {
 
     private fun startVpn() {
         if (isRunning) return
+        val nowMs = System.currentTimeMillis()
+        if (nowMs < restartAllowedAtMs) {
+            val delayMs = restartAllowedAtMs - nowMs
+            // WHY: Cooldown prevents rapid restart loops from starving the UI thread.
+            Log.w(TAG, "VPN restart cooldown active (${delayMs}ms remaining, lastFatalStopAtMs=$lastFatalStopAtMs)")
+            stopSelf()
+            return
+        }
         val builder = Builder()
             .setSession("DNS AdBlocker")
             .addAddress(VPN_ADDRESS, 32)
@@ -162,6 +170,7 @@ class DnsVpnService : VpnService() {
         requestQueue = null
         responseQueue = null
         lastResponseWriteAtMs = 0
+        responseWriterStallCount.set(0)
         fatalStopRequested = false
         stopForeground(true)
         isRunning = false
@@ -249,6 +258,7 @@ class DnsVpnService : VpnService() {
         responseQueue: BlockingQueue<ByteArray>
     ) {
         lastResponseWriteAtMs = System.currentTimeMillis()
+        responseWriterStallCount.set(0)
         responseWriter = Thread {
             val batch = ArrayList<ByteArray>(RESPONSE_DRAIN_MAX)
             while (!stopSignal.get()) {
@@ -265,6 +275,7 @@ class DnsVpnService : VpnService() {
                     for (payload in batch) {
                         output.write(payload)
                         lastResponseWriteAtMs = System.currentTimeMillis()
+                        responseWriterStallCount.set(0)
                     }
                 } catch (error: IOException) {
                     if (!stopSignal.get()) {
@@ -291,16 +302,23 @@ class DnsVpnService : VpnService() {
                     break
                 }
                 val queue = responseQueue
-                // WHY: Only trip when responses are pending to avoid idle false positives.
-                if (queue != null && queue.isNotEmpty()) {
-                    val lastWriteAtMs = lastResponseWriteAtMs
-                    val nowMs = System.currentTimeMillis()
-                    if (lastWriteAtMs > 0 && nowMs - lastWriteAtMs >= RESPONSE_WRITE_STALL_MS) {
+                if (queue == null || queue.isEmpty()) {
+                    responseWriterStallCount.set(0)
+                    continue
+                }
+                // WHY: Require consecutive stalled checks to avoid single-blip false positives.
+                val lastWriteAtMs = lastResponseWriteAtMs
+                val nowMs = System.currentTimeMillis()
+                if (lastWriteAtMs > 0 && nowMs - lastWriteAtMs >= RESPONSE_WRITE_STALL_MS) {
+                    val misses = responseWriterStallCount.incrementAndGet()
+                    if (misses >= RESPONSE_WATCHDOG_MAX_MISSES) {
                         requestFatalStop(
                             "responseWriter stalled for ${nowMs - lastWriteAtMs}ms with pending responses"
                         )
                         break
                     }
+                } else {
+                    responseWriterStallCount.set(0)
                 }
             }
         }.apply { start() }
@@ -483,6 +501,10 @@ class DnsVpnService : VpnService() {
         } else {
             Log.w(TAG, reason, error)
         }
+        // WHY: Cooldown avoids rapid restart loops after fatal writer failures.
+        val nowMs = System.currentTimeMillis()
+        lastFatalStopAtMs = nowMs
+        restartAllowedAtMs = nowMs + FATAL_RESTART_COOLDOWN_MS
         // WHY: Ensure the read loop observes a fatal stop after responseWriter failures.
         fatalStopRequested = true
         stopSignal.set(true)
@@ -517,11 +539,13 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
         private const val RESPONSE_WATCHDOG_INTERVAL_MS = 2000L
-        private const val RESPONSE_WRITE_STALL_MS = 10000L
+        private const val RESPONSE_WRITE_STALL_MS = 15000L
+        private const val RESPONSE_WATCHDOG_MAX_MISSES = 3
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
         private const val REQUEST_QUEUE_WAIT_MS = 10L
         private const val NETWORK_IDLE_RESET_THRESHOLD_MS = 5000L
+        private const val FATAL_RESTART_COOLDOWN_MS = 15000L
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
@@ -548,11 +572,16 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var lastResponseWriteAtMs: Long = 0
     @Volatile
+    private var lastFatalStopAtMs: Long = 0
+    @Volatile
+    private var restartAllowedAtMs: Long = 0
+    @Volatile
     private var pendingNetworkReset: Boolean = false
     @Volatile
     private var fatalStopRequested: Boolean = false
     private val upstreamResetLock = Any()
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
+    private val responseWriterStallCount = AtomicInteger(0)
     private val stopSignal = AtomicBoolean(false)
 }
