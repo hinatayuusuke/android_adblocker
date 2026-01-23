@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -106,13 +108,23 @@ class DnsVpnService : VpnService() {
             .addAddress(VPN_ADDRESS, 32)
             .addDnsServer(DNS_SERVER)
             .addRoute(DNS_SERVER, 32)
+            .apply {
+                try {
+                    addDisallowedApplication(packageName)
+                } catch (error: Exception) {
+                    // WHY: Some devices throw NameNotFoundException; exclude failure should not block VPN start.
+                    Log.w(TAG, "Failed to exclude self from VPN: ${error.message}")
+                }
+            }
 
         val vpnInterface = builder.establish() ?: return
         val allowlist = loadAllowlist()
         val matcher = DomainRuleMatcher(emptySet(), allowlist)
         startNetworkMonitor()
+        startScreenMonitor()
         val sockets = createUpstreamSockets(currentNetwork)
         if (sockets.isEmpty()) {
+            stopScreenMonitor()
             stopNetworkMonitor()
             vpnInterface.close()
             return
@@ -156,6 +168,7 @@ class DnsVpnService : VpnService() {
         lastPacketAtMs = 0
         pendingNetworkReset = false
         stopNetworkMonitor()
+        stopScreenMonitor()
         val worker = workerThread
         worker?.interrupt()
         joinThread(worker, "packetLoop")
@@ -225,6 +238,7 @@ class DnsVpnService : VpnService() {
                 }
                 if (length == 0) continue
                 lastPacketAtMs = System.currentTimeMillis()
+                updateIdleModeIfNeeded("packet")
                 if (pendingNetworkReset) {
                     pendingNetworkReset = false
                     handleNetworkChange()
@@ -304,6 +318,7 @@ class DnsVpnService : VpnService() {
                     break
                 }
                 if (!isRunning || stopSignal.get()) break
+                updateIdleModeIfNeeded("watchdog")
                 val writer = responseWriter
                 if (writer == null || !writer.isAlive) {
                     requestFatalStop("responseWriter thread is not alive")
@@ -341,13 +356,45 @@ class DnsVpnService : VpnService() {
         upstreamWorkers = sockets.map { socket ->
             Thread {
                 val resolver = UpstreamResolver(socket, UPSTREAM_DNS)
+                var consecutiveFailures = 0
                 while (!stopSignal.get()) {
                     val job = try {
                         requestQueue.take()
                     } catch (_: InterruptedException) {
                         break
                     }
-                    val responsePayload = resolver.resolve(job.queryPayload)
+                    updateIdleModeIfNeeded("upstream")
+                    if (isIdleMode) {
+                        if (requestQueue.size >= IDLE_QUEUE_DROP_THRESHOLD) {
+                            // WHY: Idle mode favors freshness over backlog on background traffic.
+                            val responsePayload = processor.buildServfailResponse(job.query)
+                            val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
+                            enqueueResponse(responseQueue, response)
+                            if (DEBUG_LOGS) {
+                                Log.d(TAG, "idle drop requestQueueSize=${requestQueue.size}")
+                            }
+                            continue
+                        }
+                        try {
+                            Thread.sleep(IDLE_UPSTREAM_DELAY_MS)
+                        } catch (_: InterruptedException) {
+                            Thread.currentThread().interrupt()
+                            break
+                        }
+                    }
+                    val resolvedPayload = resolver.resolve(job.queryPayload)
+                    if (resolvedPayload == null) {
+                        consecutiveFailures += 1
+                        if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
+                            // WHY: Detect stuck upstream and trigger a network reset recovery.
+                            consecutiveFailures = 0
+                            Log.w(TAG, "Upstream failures reached $UPSTREAM_FAILURE_RESET_THRESHOLD; scheduling reset")
+                            scheduleNetworkReset()
+                        }
+                    } else {
+                        consecutiveFailures = 0
+                    }
+                    val responsePayload = resolvedPayload
                         ?: processor.buildServfailResponse(job.query)
                     val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
                     enqueueResponse(responseQueue, response)
@@ -357,34 +404,117 @@ class DnsVpnService : VpnService() {
     }
 
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
+        if (queue.offer(response)) return
+        // WHY: Prefer freshest DNS replies over backlogged responses under pressure.
+        queue.poll()
+        val count = responseDropCount.incrementAndGet()
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "response drop count=$count responseQueueSize=${queue.size}")
+        }
         if (!queue.offer(response)) {
-            Log.w(TAG, "DNS応答キューが満杯のため破棄します。")
-            val count = responseDropCount.incrementAndGet()
-            if (DEBUG_LOGS) {
-                Log.d(TAG, "response drop count=$count responseQueueSize=${queue.size}")
+            requestFatalStop("responseQueue stuck (size=${queue.size})")
+        }
+    }
+
+    private fun startScreenMonitor() {
+        if (screenStateReceiver != null) return
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val nowMs = System.currentTimeMillis()
+        if (isScreenInteractive(powerManager)) {
+            lastScreenOnAtMs = nowMs
+        } else {
+            lastScreenOffAtMs = nowMs
+        }
+        updateIdleModeIfNeeded("screen_init", nowMs)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val action = intent.action ?: return
+                val timestamp = System.currentTimeMillis()
+                when (action) {
+                    Intent.ACTION_SCREEN_ON -> {
+                        lastScreenOnAtMs = timestamp
+                        updateIdleModeIfNeeded("screen_on", timestamp)
+                    }
+                    Intent.ACTION_SCREEN_OFF -> {
+                        lastScreenOffAtMs = timestamp
+                        updateIdleModeIfNeeded("screen_off", timestamp)
+                    }
+                }
             }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        registerReceiver(receiver, filter)
+        screenStateReceiver = receiver
+    }
+
+    private fun stopScreenMonitor() {
+        val receiver = screenStateReceiver ?: return
+        try {
+            unregisterReceiver(receiver)
+        } catch (_: IllegalArgumentException) {
+            // WHY: Receiver may already be unregistered during teardown races.
+        }
+        screenStateReceiver = null
+        isIdleMode = false
+        lastScreenOnAtMs = 0
+        lastScreenOffAtMs = 0
+    }
+
+    private fun updateIdleModeIfNeeded(reason: String, nowMs: Long = System.currentTimeMillis()) {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val screenOn = isScreenInteractive(powerManager)
+        if (screenOn) {
+            if (isIdleMode) {
+                isIdleMode = false
+                if (DEBUG_LOGS) {
+                    Log.d(TAG, "Idle mode exit reason=$reason")
+                }
+            }
+            return
+        }
+        val idleSinceMs = when {
+            lastPacketAtMs > 0 -> lastPacketAtMs
+            lastScreenOffAtMs > 0 -> lastScreenOffAtMs
+            else -> nowMs
+        }
+        val shouldIdle = nowMs - idleSinceMs >= IDLE_ENTER_MS
+        if (shouldIdle != isIdleMode) {
+            isIdleMode = shouldIdle
+            if (DEBUG_LOGS) {
+                val state = if (shouldIdle) "enter" else "exit"
+                Log.d(TAG, "Idle mode $state reason=$reason idleForMs=${nowMs - idleSinceMs}")
+            }
+        }
+    }
+
+    private fun isScreenInteractive(powerManager: PowerManager): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
+            powerManager.isInteractive
+        } else {
+            @Suppress("DEPRECATION")
+            powerManager.isScreenOn
         }
     }
 
     private fun startNetworkMonitor() {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        currentNetwork = manager.activeNetwork
+        currentNetwork = selectUpstreamNetwork(manager)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 lastNetworkAvailableAtMs = System.currentTimeMillis()
-                updateCurrentNetwork(network)
+                updateCurrentNetwork("available")
             }
 
             override fun onLost(network: Network) {
                 lastNetworkLostAtMs = System.currentTimeMillis()
-                if (currentNetwork == network) {
-                    currentNetwork = null
-                    scheduleNetworkReset()
-                }
+                updateCurrentNetwork("lost")
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                updateCurrentNetwork(network)
+                updateCurrentNetwork("capabilities")
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -411,11 +541,41 @@ class DnsVpnService : VpnService() {
         lastNetworkLostAtMs = 0
     }
 
-    private fun updateCurrentNetwork(network: Network) {
-        if (currentNetwork == network) return
-        // WHY: Avoid socket resets for capability-only updates (signal strength/bandwidth).
-        currentNetwork = network
+    private fun updateCurrentNetwork(reason: String) {
+        val manager = connectivityManager ?: return
+        val selected = selectUpstreamNetwork(manager)
+        if (currentNetwork == selected) return
+        // WHY: Avoid binding upstream sockets to VPN transport networks.
+        currentNetwork = selected
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "Upstream network updated reason=$reason selected=$selected")
+        }
         scheduleNetworkReset()
+    }
+
+    private fun selectUpstreamNetwork(manager: ConnectivityManager): Network? {
+        val networks = manager.allNetworks
+        if (networks.isEmpty()) return null
+        var fallback: Network? = null
+        for (network in networks) {
+            val caps = manager.getNetworkCapabilities(network) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                if (DEBUG_LOGS) {
+                    Log.d(TAG, "Skip VPN network=$network")
+                }
+                continue
+            }
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            if (validated) {
+                return network
+            }
+            if (fallback == null) {
+                fallback = network
+            }
+        }
+        return fallback
     }
 
     private fun scheduleNetworkReset() {
@@ -608,12 +768,16 @@ class DnsVpnService : VpnService() {
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
         private const val UPSTREAM_WORKER_COUNT = 6
+        private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 20
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
         private const val RESPONSE_WATCHDOG_INTERVAL_MS = 2000L
         private const val RESPONSE_WRITE_STALL_MS = 15000L
         private const val RESPONSE_WATCHDOG_MAX_MISSES = 3
+        private const val IDLE_ENTER_MS = 15000L
+        private const val IDLE_UPSTREAM_DELAY_MS = 500L
+        private const val IDLE_QUEUE_DROP_THRESHOLD = 128
         private const val THREAD_JOIN_TIMEOUT_MS = 500L
         private const val BLOCKLIST_ASSET = "blocklist.txt"
         private const val PACKET_BUFFER_SIZE = 32767
@@ -649,10 +813,17 @@ class DnsVpnService : VpnService() {
     private var processor: DnsPacketProcessor? = null
     private var requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>? = null
     private var responseQueue: BlockingQueue<ByteArray>? = null
+    private var screenStateReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile
     private var currentNetwork: Network? = null
+    @Volatile
+    private var isIdleMode: Boolean = false
+    @Volatile
+    private var lastScreenOnAtMs: Long = 0
+    @Volatile
+    private var lastScreenOffAtMs: Long = 0
     @Volatile
     private var lastNetworkAvailableAtMs: Long = 0
     @Volatile
