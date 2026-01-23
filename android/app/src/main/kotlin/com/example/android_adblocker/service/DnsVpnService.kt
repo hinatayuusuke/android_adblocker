@@ -108,6 +108,14 @@ class DnsVpnService : VpnService() {
             .addAddress(VPN_ADDRESS, 32)
             .addDnsServer(DNS_SERVER)
             .addRoute(DNS_SERVER, 32)
+            .apply {
+                try {
+                    addDisallowedApplication(packageName)
+                } catch (error: Exception) {
+                    // WHY: Some devices throw NameNotFoundException; exclude failure should not block VPN start.
+                    Log.w(TAG, "Failed to exclude self from VPN: ${error.message}")
+                }
+            }
 
         val vpnInterface = builder.establish() ?: return
         val allowlist = loadAllowlist()
@@ -348,6 +356,7 @@ class DnsVpnService : VpnService() {
         upstreamWorkers = sockets.map { socket ->
             Thread {
                 val resolver = UpstreamResolver(socket, UPSTREAM_DNS)
+                var consecutiveFailures = 0
                 while (!stopSignal.get()) {
                     val job = try {
                         requestQueue.take()
@@ -373,7 +382,19 @@ class DnsVpnService : VpnService() {
                             break
                         }
                     }
-                    val responsePayload = resolver.resolve(job.queryPayload)
+                    val resolvedPayload = resolver.resolve(job.queryPayload)
+                    if (resolvedPayload == null) {
+                        consecutiveFailures += 1
+                        if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
+                            // WHY: Detect stuck upstream and trigger a network reset recovery.
+                            consecutiveFailures = 0
+                            Log.w(TAG, "Upstream failures reached $UPSTREAM_FAILURE_RESET_THRESHOLD; scheduling reset")
+                            scheduleNetworkReset()
+                        }
+                    } else {
+                        consecutiveFailures = 0
+                    }
+                    val responsePayload = resolvedPayload
                         ?: processor.buildServfailResponse(job.query)
                     val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
                     enqueueResponse(responseQueue, response)
@@ -383,12 +404,15 @@ class DnsVpnService : VpnService() {
     }
 
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
+        if (queue.offer(response)) return
+        // WHY: Prefer freshest DNS replies over backlogged responses under pressure.
+        queue.poll()
+        val count = responseDropCount.incrementAndGet()
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "response drop count=$count responseQueueSize=${queue.size}")
+        }
         if (!queue.offer(response)) {
-            Log.w(TAG, "DNS応答キューが満杯のため破棄します。")
-            val count = responseDropCount.incrementAndGet()
-            if (DEBUG_LOGS) {
-                Log.d(TAG, "response drop count=$count responseQueueSize=${queue.size}")
-            }
+            requestFatalStop("responseQueue stuck (size=${queue.size})")
         }
     }
 
@@ -477,23 +501,20 @@ class DnsVpnService : VpnService() {
 
     private fun startNetworkMonitor() {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        currentNetwork = manager.activeNetwork
+        currentNetwork = selectUpstreamNetwork(manager)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 lastNetworkAvailableAtMs = System.currentTimeMillis()
-                updateCurrentNetwork(network)
+                updateCurrentNetwork("available")
             }
 
             override fun onLost(network: Network) {
                 lastNetworkLostAtMs = System.currentTimeMillis()
-                if (currentNetwork == network) {
-                    currentNetwork = null
-                    scheduleNetworkReset()
-                }
+                updateCurrentNetwork("lost")
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                updateCurrentNetwork(network)
+                updateCurrentNetwork("capabilities")
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -520,11 +541,41 @@ class DnsVpnService : VpnService() {
         lastNetworkLostAtMs = 0
     }
 
-    private fun updateCurrentNetwork(network: Network) {
-        if (currentNetwork == network) return
-        // WHY: Avoid socket resets for capability-only updates (signal strength/bandwidth).
-        currentNetwork = network
+    private fun updateCurrentNetwork(reason: String) {
+        val manager = connectivityManager ?: return
+        val selected = selectUpstreamNetwork(manager)
+        if (currentNetwork == selected) return
+        // WHY: Avoid binding upstream sockets to VPN transport networks.
+        currentNetwork = selected
+        if (DEBUG_LOGS) {
+            Log.d(TAG, "Upstream network updated reason=$reason selected=$selected")
+        }
         scheduleNetworkReset()
+    }
+
+    private fun selectUpstreamNetwork(manager: ConnectivityManager): Network? {
+        val networks = manager.allNetworks
+        if (networks.isEmpty()) return null
+        var fallback: Network? = null
+        for (network in networks) {
+            val caps = manager.getNetworkCapabilities(network) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                if (DEBUG_LOGS) {
+                    Log.d(TAG, "Skip VPN network=$network")
+                }
+                continue
+            }
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            if (validated) {
+                return network
+            }
+            if (fallback == null) {
+                fallback = network
+            }
+        }
+        return fallback
     }
 
     private fun scheduleNetworkReset() {
@@ -717,6 +768,7 @@ class DnsVpnService : VpnService() {
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
         private const val UPSTREAM_WORKER_COUNT = 6
+        private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 20
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
