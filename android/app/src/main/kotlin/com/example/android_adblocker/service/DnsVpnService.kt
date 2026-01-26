@@ -441,7 +441,7 @@ class DnsVpnService : VpnService() {
     private fun awaitWatchdog(timeoutMs: Long): Boolean {
         synchronized(responseWatchdogLock) {
             try {
-                responseWatchdogLock.wait(timeoutMs)
+                (responseWatchdogLock as java.lang.Object).wait(timeoutMs)
                 return true
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
@@ -452,7 +452,7 @@ class DnsVpnService : VpnService() {
 
     private fun signalResponseWatchdog() {
         synchronized(responseWatchdogLock) {
-            responseWatchdogLock.notifyAll()
+            (responseWatchdogLock as java.lang.Object).notifyAll()
         }
     }
 
