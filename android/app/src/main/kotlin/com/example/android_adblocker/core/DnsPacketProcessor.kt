@@ -93,6 +93,10 @@ internal class DnsPacketProcessor(
         return buildErrorResponse(query, DNS_RCODE_SERVFAIL)
     }
 
+    fun cacheKey(query: DnsQuery): String {
+        return "${query.domain}|${query.qtype}|${query.qclass}"
+    }
+
     private fun parseQuery(packet: ByteArray, offset: Int, length: Int): DnsQuery? {
         if (length < DNS_HEADER_LEN) return null
         val end = offset + length
@@ -123,12 +127,16 @@ internal class DnsPacketProcessor(
         val questionEnd = index + 4
         val question = packet.copyOfRange(offset + DNS_HEADER_LEN, questionEnd)
         if (question.isEmpty()) return null
+        val qtype = readU16(question, question.size - 4)
+        val qclass = readU16(question, question.size - 2)
 
         return DnsQuery(
             id = id,
             flags = flags,
             question = question,
-            domain = domainBuilder.toString()
+            domain = domainBuilder.toString(),
+            qtype = qtype,
+            qclass = qclass
         )
     }
 
@@ -238,7 +246,9 @@ internal class DnsPacketProcessor(
         val id: Int,
         val flags: Int,
         val question: ByteArray,
-        val domain: String
+        val domain: String,
+        val qtype: Int,
+        val qclass: Int
     )
 
     private companion object {

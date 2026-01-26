@@ -22,6 +22,7 @@ import androidx.core.app.NotificationCompat
 import com.example.android_adblocker.BuildConfig
 import com.example.android_adblocker.MainActivity
 import com.example.android_adblocker.R
+import com.example.android_adblocker.core.DnsCache
 import com.example.android_adblocker.core.DnsMetrics
 import com.example.android_adblocker.core.DnsPacketProcessor
 import com.example.android_adblocker.core.DomainRuleMatcher
@@ -54,6 +55,7 @@ class DnsVpnService : VpnService() {
      */
     override fun onCreate() {
         super.onCreate()
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         createNotificationChannel()
     }
 
@@ -141,6 +143,7 @@ class DnsVpnService : VpnService() {
         pendingNetworkReset = false
         val metrics = DnsMetrics(DEBUG_LOGS)
         this.metrics = metrics
+        dnsCache = DnsCache(DNS_CACHE_MAX_ENTRIES, DNS_CACHE_TTL_MS)
 
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -194,6 +197,7 @@ class DnsVpnService : VpnService() {
         requestQueue = null
         responseQueue = null
         metrics = DnsMetrics(false)
+        dnsCache = null
         lastResponseWriteAtMs = 0
         lastResponseEnqueueAtMs = 0
         responseWriterStallCount.set(0)
@@ -382,6 +386,17 @@ class DnsVpnService : VpnService() {
                     } catch (_: InterruptedException) {
                         break
                     }
+                    val cacheKey = processor.cacheKey(job.query)
+                    val nowMs = System.currentTimeMillis()
+                    val cache = dnsCache
+                    if (cache != null) {
+                        val cachedPayload = cache.get(cacheKey, job.query.id, nowMs)
+                        if (cachedPayload != null) {
+                            val response = processor.buildUdpResponse(job.packetInfo, cachedPayload)
+                            enqueueResponse(responseQueue, response)
+                            continue
+                        }
+                    }
                     updateIdleModeIfNeeded("upstream")
                     if (isIdleMode) {
                         if (requestQueue.size >= IDLE_QUEUE_DROP_THRESHOLD) {
@@ -417,6 +432,7 @@ class DnsVpnService : VpnService() {
                         val responsePayload = processor.buildServfailResponse(job.query)
                         processor.buildUdpResponse(job.packetInfo, responsePayload)
                     } else {
+                        cache?.put(cacheKey, resolvedPayload.buffer.copyOf(resolvedPayload.length), nowMs)
                         processor.buildUdpResponse(job.packetInfo, resolvedPayload.buffer, resolvedPayload.length)
                     }
                     enqueueResponse(responseQueue, response)
@@ -474,9 +490,11 @@ class DnsVpnService : VpnService() {
 
     private fun startScreenMonitor() {
         if (screenStateReceiver != null) return
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val powerManager = powerManager ?: (getSystemService(Context.POWER_SERVICE) as PowerManager)
         val nowMs = System.currentTimeMillis()
-        if (isScreenInteractive(powerManager)) {
+        val screenOn = isScreenInteractive(powerManager)
+        screenInteractive = screenOn
+        if (screenOn) {
             lastScreenOnAtMs = nowMs
         } else {
             lastScreenOffAtMs = nowMs
@@ -489,10 +507,12 @@ class DnsVpnService : VpnService() {
                 when (action) {
                     Intent.ACTION_SCREEN_ON -> {
                         lastScreenOnAtMs = timestamp
+                        screenInteractive = true
                         updateIdleModeIfNeeded("screen_on", timestamp)
                     }
                     Intent.ACTION_SCREEN_OFF -> {
                         lastScreenOffAtMs = timestamp
+                        screenInteractive = false
                         updateIdleModeIfNeeded("screen_off", timestamp)
                     }
                 }
@@ -515,14 +535,13 @@ class DnsVpnService : VpnService() {
         }
         screenStateReceiver = null
         isIdleMode = false
+        screenInteractive = false
         lastScreenOnAtMs = 0
         lastScreenOffAtMs = 0
     }
 
     private fun updateIdleModeIfNeeded(reason: String, nowMs: Long = System.currentTimeMillis()) {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        val screenOn = isScreenInteractive(powerManager)
-        if (screenOn) {
+        if (screenInteractive) {
             if (isIdleMode) {
                 isIdleMode = false
                 if (DEBUG_LOGS) {
@@ -779,7 +798,7 @@ class DnsVpnService : VpnService() {
         val writerState = responseWriter?.state?.name ?: "null"
         val networkPresent = currentNetwork != null
         val errorType = error?.javaClass?.simpleName ?: "none"
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val powerManager = powerManager ?: return
         val isPowerSave = powerManager.isPowerSaveMode
         val isIdle = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             powerManager.isDeviceIdleMode
@@ -843,6 +862,9 @@ class DnsVpnService : VpnService() {
         private const val REQUEST_QUEUE_WAIT_MS = 10L
         private const val NETWORK_IDLE_RESET_THRESHOLD_MS = 5000L
         private const val FATAL_RESTART_COOLDOWN_MS = 15000L
+        // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
+        private const val DNS_CACHE_MAX_ENTRIES = 1024
+        private const val DNS_CACHE_TTL_MS = 60000L
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
@@ -872,14 +894,18 @@ class DnsVpnService : VpnService() {
     private var processor: DnsPacketProcessor? = null
     private var requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>? = null
     private var responseQueue: BlockingQueue<ByteArray>? = null
+    private var dnsCache: DnsCache? = null
     private var metrics: DnsMetrics = DnsMetrics(false)
     private var screenStateReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var powerManager: PowerManager? = null
     @Volatile
     private var currentNetwork: Network? = null
     @Volatile
     private var isIdleMode: Boolean = false
+    @Volatile
+    private var screenInteractive: Boolean = false
     @Volatile
     private var lastScreenOnAtMs: Long = 0
     @Volatile
