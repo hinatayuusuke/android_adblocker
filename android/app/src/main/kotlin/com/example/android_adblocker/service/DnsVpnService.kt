@@ -331,7 +331,7 @@ class DnsVpnService : VpnService() {
                 if (queue == null || queue.isEmpty()) {
                     responseWriterStallCount.set(0)
                     metrics.onWatchdogQueueEmpty()
-                    if (!awaitWatchdog(RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS)) {
+                    if (!awaitWatchdog(RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS, true)) {
                         break
                     }
                     continue
@@ -349,7 +349,7 @@ class DnsVpnService : VpnService() {
                 } else {
                     responseWriterStallCount.set(0)
                 }
-                if (!awaitWatchdog(RESPONSE_WATCHDOG_INTERVAL_MS)) {
+                if (!awaitWatchdog(RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS, false)) {
                     break
                 }
             }
@@ -438,20 +438,25 @@ class DnsVpnService : VpnService() {
         }
     }
 
-    private fun awaitWatchdog(timeoutMs: Long): Boolean {
+    private fun awaitWatchdog(timeoutMs: Long, isLongWait: Boolean): Boolean {
         synchronized(responseWatchdogLock) {
+            responseWatchdogLongWait = isLongWait
             try {
                 (responseWatchdogLock as java.lang.Object).wait(timeoutMs)
                 return true
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return false
+            } finally {
+                responseWatchdogLongWait = false
             }
         }
     }
 
     private fun signalResponseWatchdog() {
         synchronized(responseWatchdogLock) {
+            if (!responseWatchdogLongWait) return
+            // WHY: Avoid waking the watchdog during short active waits.
             (responseWatchdogLock as java.lang.Object).notifyAll()
         }
     }
@@ -812,7 +817,7 @@ class DnsVpnService : VpnService() {
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
-        private const val RESPONSE_WATCHDOG_INTERVAL_MS = 2000L
+        private const val RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS = 5000L
         private const val RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS = 60000L
         private const val RESPONSE_WRITE_STALL_MS = 15000L
         private const val RESPONSE_WATCHDOG_MAX_MISSES = 3
@@ -879,6 +884,8 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var fatalStopRequested: Boolean = false
     private val responseWatchdogLock = Any()
+    @Volatile
+    private var responseWatchdogLongWait: Boolean = false
     private val upstreamResetLock = Any()
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
