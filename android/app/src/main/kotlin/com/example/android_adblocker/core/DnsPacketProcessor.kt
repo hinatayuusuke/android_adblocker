@@ -58,7 +58,11 @@ internal class DnsPacketProcessor(
     }
 
     fun buildUdpResponse(packetInfo: PacketInfo, dnsPayload: ByteArray): ByteArray {
-        val udpLength = UDP_HEADER_LEN + dnsPayload.size
+        return buildUdpResponse(packetInfo, dnsPayload, dnsPayload.size)
+    }
+
+    fun buildUdpResponse(packetInfo: PacketInfo, dnsPayload: ByteArray, dnsLength: Int): ByteArray {
+        val udpLength = UDP_HEADER_LEN + dnsLength
         val totalLength = IPV4_HEADER_MIN_LEN + udpLength
         val buffer = ByteArray(totalLength)
 
@@ -80,7 +84,7 @@ internal class DnsPacketProcessor(
         writeU16(buffer, IPV4_HEADER_MIN_LEN + 4, udpLength)
         // WHY: IPv4のUDPチェックサムは省略可能で、フィルタ専用の負荷を抑えるため0にする。
         writeU16(buffer, IPV4_HEADER_MIN_LEN + 6, 0)
-        System.arraycopy(dnsPayload, 0, buffer, IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN, dnsPayload.size)
+        System.arraycopy(dnsPayload, 0, buffer, IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN, dnsLength)
 
         return buffer
     }

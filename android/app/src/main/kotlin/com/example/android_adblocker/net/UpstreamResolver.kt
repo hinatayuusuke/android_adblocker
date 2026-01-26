@@ -17,8 +17,10 @@ internal class UpstreamResolver(
     private val responseBuffer = ByteArray(1500)
     private val responsePacket = DatagramPacket(responseBuffer, responseBuffer.size)
     private val requestPacket = DatagramPacket(ByteArray(0), 0, upstream)
+    // WHY: レスポンスはワーカースレッド単位で扱い、都度のラッパー生成を避ける。
+    private val responseView = UpstreamResponse(responseBuffer, 0)
 
-    fun resolve(query: ByteArray): ByteArray? {
+    fun resolve(query: ByteArray): UpstreamResponse? {
         return try {
             val startNs = System.nanoTime()
             metrics.onUpstreamSend()
@@ -35,12 +37,15 @@ internal class UpstreamResolver(
                 Log.d(TAG, "upstream recv after length=${responsePacket.length} elapsedMs=$elapsedMs")
             }
             metrics.onUpstreamSuccess()
-            responseBuffer.copyOf(responsePacket.length)
+            responseView.length = responsePacket.length
+            responseView
         } catch (_: IOException) {
             metrics.onUpstreamFailure()
             null
         }
     }
+
+    internal data class UpstreamResponse(val buffer: ByteArray, var length: Int)
 
     private companion object {
         private const val TAG = "UpstreamResolver"

@@ -317,12 +317,6 @@ class DnsVpnService : VpnService() {
     private fun startResponseWatchdog(metrics: DnsMetrics) {
         responseWatchdog = Thread {
             while (!stopSignal.get()) {
-                try {
-                    Thread.sleep(RESPONSE_WATCHDOG_INTERVAL_MS)
-                } catch (_: InterruptedException) {
-                    break
-                }
-                if (!isRunning || stopSignal.get()) break
                 val nowMs = System.currentTimeMillis()
                 metrics.onWatchdogWake()
                 // WHY: Reuse the watchdog tick to avoid introducing a new reporting timer.
@@ -337,6 +331,9 @@ class DnsVpnService : VpnService() {
                 if (queue == null || queue.isEmpty()) {
                     responseWriterStallCount.set(0)
                     metrics.onWatchdogQueueEmpty()
+                    if (!awaitWatchdog(RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS)) {
+                        break
+                    }
                     continue
                 }
                 // WHY: Require consecutive stalled checks to avoid single-blip false positives.
@@ -351,6 +348,9 @@ class DnsVpnService : VpnService() {
                     }
                 } else {
                     responseWriterStallCount.set(0)
+                }
+                if (!awaitWatchdog(RESPONSE_WATCHDOG_INTERVAL_MS)) {
+                    break
                 }
             }
         }.apply { start() }
@@ -404,9 +404,12 @@ class DnsVpnService : VpnService() {
                     } else {
                         consecutiveFailures = 0
                     }
-                    val responsePayload = resolvedPayload
-                        ?: processor.buildServfailResponse(job.query)
-                    val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
+                    val response = if (resolvedPayload == null) {
+                        val responsePayload = processor.buildServfailResponse(job.query)
+                        processor.buildUdpResponse(job.packetInfo, responsePayload)
+                    } else {
+                        processor.buildUdpResponse(job.packetInfo, resolvedPayload.buffer, resolvedPayload.length)
+                    }
                     enqueueResponse(responseQueue, response)
                 }
             }.apply { start() }
@@ -414,7 +417,12 @@ class DnsVpnService : VpnService() {
     }
 
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
-        if (queue.offer(response)) return
+        if (queue.offer(response)) {
+            if (queue.size == 1) {
+                signalResponseWatchdog()
+            }
+            return
+        }
         // WHY: Prefer freshest DNS replies over backlogged responses under pressure.
         queue.poll()
         val count = responseDropCount.incrementAndGet()
@@ -423,6 +431,28 @@ class DnsVpnService : VpnService() {
         }
         if (!queue.offer(response)) {
             requestFatalStop("responseQueue stuck (size=${queue.size})")
+            return
+        }
+        if (queue.size == 1) {
+            signalResponseWatchdog()
+        }
+    }
+
+    private fun awaitWatchdog(timeoutMs: Long): Boolean {
+        synchronized(responseWatchdogLock) {
+            try {
+                responseWatchdogLock.wait(timeoutMs)
+                return true
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+    }
+
+    private fun signalResponseWatchdog() {
+        synchronized(responseWatchdogLock) {
+            responseWatchdogLock.notifyAll()
         }
     }
 
@@ -783,6 +813,7 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
         private const val RESPONSE_WATCHDOG_INTERVAL_MS = 2000L
+        private const val RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS = 60000L
         private const val RESPONSE_WRITE_STALL_MS = 15000L
         private const val RESPONSE_WATCHDOG_MAX_MISSES = 3
         private const val IDLE_ENTER_MS = 15000L
@@ -847,6 +878,7 @@ class DnsVpnService : VpnService() {
     private var pendingNetworkReset: Boolean = false
     @Volatile
     private var fatalStopRequested: Boolean = false
+    private val responseWatchdogLock = Any()
     private val upstreamResetLock = Any()
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
