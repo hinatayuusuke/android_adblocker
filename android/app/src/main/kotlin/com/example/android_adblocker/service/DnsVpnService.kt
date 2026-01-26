@@ -22,6 +22,7 @@ import androidx.core.app.NotificationCompat
 import com.example.android_adblocker.BuildConfig
 import com.example.android_adblocker.MainActivity
 import com.example.android_adblocker.R
+import com.example.android_adblocker.core.DnsMetrics
 import com.example.android_adblocker.core.DnsPacketProcessor
 import com.example.android_adblocker.core.DomainRuleMatcher
 import com.example.android_adblocker.data.BlocklistLoader
@@ -138,6 +139,8 @@ class DnsVpnService : VpnService() {
         lastPacketAtMs = 0
         lastResponseWriteAtMs = 0
         pendingNetworkReset = false
+        val metrics = DnsMetrics(DEBUG_LOGS)
+        this.metrics = metrics
 
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -150,7 +153,7 @@ class DnsVpnService : VpnService() {
         isRunning = true
 
         workerThread = Thread {
-            runPacketLoop(vpnInterface, sockets, matcher)
+            runPacketLoop(vpnInterface, sockets, matcher, metrics)
         }.apply { start() }
 
         // WHY: FGS開始猶予を超えないよう、重いブロックリスト読込は別スレッドで行う。
@@ -190,6 +193,7 @@ class DnsVpnService : VpnService() {
         processor = null
         requestQueue = null
         responseQueue = null
+        metrics = DnsMetrics(false)
         lastResponseWriteAtMs = 0
         responseWriterStallCount.set(0)
         fatalStopRequested = false
@@ -205,7 +209,8 @@ class DnsVpnService : VpnService() {
     private fun runPacketLoop(
         vpnInterface: ParcelFileDescriptor,
         sockets: List<DatagramSocket>,
-        matcher: DomainRuleMatcher
+        matcher: DomainRuleMatcher,
+        metrics: DnsMetrics
     ) {
         val input = FileInputStream(vpnInterface.fileDescriptor)
         val output = FileOutputStream(vpnInterface.fileDescriptor)
@@ -221,8 +226,8 @@ class DnsVpnService : VpnService() {
         this.requestQueue = requestQueue
         this.responseQueue = responseQueue
         startResponseWriter(output, responseQueue)
-        startResponseWatchdog()
-        startUpstreamWorkers(sockets, requestQueue, responseQueue, processor)
+        startResponseWatchdog(metrics)
+        startUpstreamWorkers(sockets, requestQueue, responseQueue, processor, metrics)
 
         try {
             while (!stopSignal.get()) {
@@ -309,7 +314,7 @@ class DnsVpnService : VpnService() {
         }.apply { start() }
     }
 
-    private fun startResponseWatchdog() {
+    private fun startResponseWatchdog(metrics: DnsMetrics) {
         responseWatchdog = Thread {
             while (!stopSignal.get()) {
                 try {
@@ -318,7 +323,11 @@ class DnsVpnService : VpnService() {
                     break
                 }
                 if (!isRunning || stopSignal.get()) break
-                updateIdleModeIfNeeded("watchdog")
+                val nowMs = System.currentTimeMillis()
+                metrics.onWatchdogWake()
+                // WHY: Reuse the watchdog tick to avoid introducing a new reporting timer.
+                metrics.maybeReport("watchdog", nowMs)
+                updateIdleModeIfNeeded("watchdog", nowMs)
                 val writer = responseWriter
                 if (writer == null || !writer.isAlive) {
                     requestFatalStop("responseWriter thread is not alive")
@@ -327,11 +336,11 @@ class DnsVpnService : VpnService() {
                 val queue = responseQueue
                 if (queue == null || queue.isEmpty()) {
                     responseWriterStallCount.set(0)
+                    metrics.onWatchdogQueueEmpty()
                     continue
                 }
                 // WHY: Require consecutive stalled checks to avoid single-blip false positives.
                 val lastWriteAtMs = lastResponseWriteAtMs
-                val nowMs = System.currentTimeMillis()
                 if (lastWriteAtMs > 0 && nowMs - lastWriteAtMs >= RESPONSE_WRITE_STALL_MS) {
                     val misses = responseWriterStallCount.incrementAndGet()
                     if (misses >= RESPONSE_WATCHDOG_MAX_MISSES) {
@@ -351,11 +360,12 @@ class DnsVpnService : VpnService() {
         sockets: List<DatagramSocket>,
         requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>,
         responseQueue: BlockingQueue<ByteArray>,
-        processor: DnsPacketProcessor
+        processor: DnsPacketProcessor,
+        metrics: DnsMetrics
     ) {
         upstreamWorkers = sockets.map { socket ->
             Thread {
-                val resolver = UpstreamResolver(socket, UPSTREAM_DNS)
+                val resolver = UpstreamResolver(socket, UPSTREAM_DNS, metrics)
                 var consecutiveFailures = 0
                 while (!stopSignal.get()) {
                     val job = try {
@@ -611,7 +621,7 @@ class DnsVpnService : VpnService() {
             val sockets = createUpstreamSockets(currentNetwork)
             if (sockets.isEmpty()) return
             upstreamSockets = sockets
-            startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor)
+            startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor, metrics)
         }
     }
 
@@ -813,6 +823,7 @@ class DnsVpnService : VpnService() {
     private var processor: DnsPacketProcessor? = null
     private var requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>? = null
     private var responseQueue: BlockingQueue<ByteArray>? = null
+    private var metrics: DnsMetrics = DnsMetrics(false)
     private var screenStateReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
