@@ -195,6 +195,7 @@ class DnsVpnService : VpnService() {
         responseQueue = null
         metrics = DnsMetrics(false)
         lastResponseWriteAtMs = 0
+        lastResponseEnqueueAtMs = 0
         responseWriterStallCount.set(0)
         fatalStopRequested = false
         stopForeground(true)
@@ -331,7 +332,15 @@ class DnsVpnService : VpnService() {
                 if (queue == null || queue.isEmpty()) {
                     responseWriterStallCount.set(0)
                     metrics.onWatchdogQueueEmpty()
-                    if (!awaitWatchdog(RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS, true)) {
+                    // WHY: Avoid long-wait notify churn when the queue empties briefly during bursts.
+                    val idleMs = nowMs - lastResponseEnqueueAtMs
+                    val shouldLongWait = idleMs >= RESPONSE_WATCHDOG_IDLE_ENTER_MS
+                    val waitMs = if (shouldLongWait) {
+                        RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS
+                    } else {
+                        RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS
+                    }
+                    if (!awaitWatchdog(waitMs, shouldLongWait)) {
                         break
                     }
                     continue
@@ -417,8 +426,10 @@ class DnsVpnService : VpnService() {
     }
 
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
+        val wasEmpty = queue.isEmpty()
+        lastResponseEnqueueAtMs = System.currentTimeMillis()
         if (queue.offer(response)) {
-            if (queue.size == 1) {
+            if (wasEmpty) {
                 signalResponseWatchdog()
             }
             return
@@ -433,7 +444,7 @@ class DnsVpnService : VpnService() {
             requestFatalStop("responseQueue stuck (size=${queue.size})")
             return
         }
-        if (queue.size == 1) {
+        if (wasEmpty) {
             signalResponseWatchdog()
         }
     }
@@ -819,6 +830,8 @@ class DnsVpnService : VpnService() {
         private const val RESPONSE_DRAIN_MAX = 32
         private const val RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS = 5000L
         private const val RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS = 60000L
+        // WHY: Require sustained idle before switching to long waits.
+        private const val RESPONSE_WATCHDOG_IDLE_ENTER_MS = 3000L
         private const val RESPONSE_WRITE_STALL_MS = 15000L
         private const val RESPONSE_WATCHDOG_MAX_MISSES = 3
         private const val IDLE_ENTER_MS = 15000L
@@ -879,6 +892,8 @@ class DnsVpnService : VpnService() {
     private var lastPacketAtMs: Long = 0
     @Volatile
     private var lastResponseWriteAtMs: Long = 0
+    @Volatile
+    private var lastResponseEnqueueAtMs: Long = 0
     @Volatile
     private var pendingNetworkReset: Boolean = false
     @Volatile
