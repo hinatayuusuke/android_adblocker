@@ -320,6 +320,7 @@ class DnsVpnService : VpnService() {
                         lastZeroReadReportAtMs = nowMs
                     }
                 }
+                try { Thread.sleep(100) } catch (_: InterruptedException) { break }
                 continue
             }
             if (!handlePacketRead(length, buffer, processor, requestQueue, responseQueue)) {
