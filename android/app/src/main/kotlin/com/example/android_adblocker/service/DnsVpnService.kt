@@ -17,6 +17,10 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
+import android.system.StructPollfd
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.example.android_adblocker.BuildConfig
@@ -29,6 +33,7 @@ import com.example.android_adblocker.core.DomainRuleMatcher
 import com.example.android_adblocker.data.BlocklistLoader
 import com.example.android_adblocker.data.VpnPreferences
 import com.example.android_adblocker.net.UpstreamResolver
+import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
@@ -144,6 +149,12 @@ class DnsVpnService : VpnService() {
         val metrics = DnsMetrics(DEBUG_LOGS)
         this.metrics = metrics
         dnsCache = DnsCache(DNS_CACHE_MAX_ENTRIES, DNS_CACHE_TTL_MS)
+        wakeupPipe?.close()
+        wakeupPipe = if (USE_POLL_LOOP) {
+            createWakeupPipe()
+        } else {
+            null
+        }
 
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -177,6 +188,7 @@ class DnsVpnService : VpnService() {
     private fun stopVpn() {
         if (!isRunning) return
         stopSignal.set(true)
+        wakeupPipe?.wake()
         lastPacketAtMs = 0
         pendingNetworkReset = false
         stopNetworkMonitor()
@@ -185,6 +197,8 @@ class DnsVpnService : VpnService() {
         worker?.interrupt()
         joinThread(worker, "packetLoop")
         workerThread = null
+        wakeupPipe?.close()
+        wakeupPipe = null
         val writer = responseWriter
         writer?.interrupt()
         joinThread(writer, "responseWriter")
@@ -217,13 +231,22 @@ class DnsVpnService : VpnService() {
         ruleMatcher?.updateAllowlist(loadAllowlist())
     }
 
+    private fun createWakeupPipe(): WakeupPipe? {
+        return try {
+            WakeupPipe.create()
+        } catch (error: Exception) {
+            // WHY: Fall back to legacy loop if the control pipe cannot be created.
+            Log.w(TAG, "Wakeup pipe create failed: ${error.message}")
+            null
+        }
+    }
+
     private fun runPacketLoop(
         vpnInterface: ParcelFileDescriptor,
         sockets: List<DatagramSocket>,
         matcher: DomainRuleMatcher,
         metrics: DnsMetrics
     ) {
-        val input = FileInputStream(vpnInterface.fileDescriptor)
         val output = FileOutputStream(vpnInterface.fileDescriptor)
         val buffer = ByteArray(PACKET_BUFFER_SIZE)
         val processor = DnsPacketProcessor(
@@ -231,7 +254,7 @@ class DnsVpnService : VpnService() {
             matcher = matcher
         )
         this.processor = processor
-         // WHY: 上流遅延時に無制限に溜めないよう、キューは上限を設ける。
+        // WHY: Bound queues prevent unbounded memory growth during bursts.
         val requestQueue = ArrayBlockingQueue<DnsPacketProcessor.UpstreamJob>(UPSTREAM_QUEUE_CAPACITY)
         val responseQueue = ArrayBlockingQueue<ByteArray>(RESPONSE_QUEUE_CAPACITY)
         this.requestQueue = requestQueue
@@ -240,83 +263,223 @@ class DnsVpnService : VpnService() {
         startResponseWatchdog(metrics)
         startUpstreamWorkers(sockets, requestQueue, responseQueue, processor, metrics)
 
-        var zeroReadCount = 0L
-        var lastZeroReadReportAtMs = System.currentTimeMillis()
+        val usePoll = USE_POLL_LOOP && wakeupPipe != null
+        val input = if (usePoll) null else FileInputStream(vpnInterface.fileDescriptor)
         try {
-            while (!stopSignal.get()) {
-                val length = try {
-                    input.read(buffer)
-                } catch (error: IOException) {
-                    Log.w(TAG, "VPN読み込み失敗: ${error.message}")
-                    break
-                }
-                if (length < 0) {
-                    Log.w(TAG, "VPN読み込みが終了したため停止します。")
-                    break
-                }
-                if (length == 0) {
-                    zeroReadCount += 1
-                    val backoffMs = minOf(ZERO_READ_MAX_SLEEP_MS, zeroReadCount)
-                    // WHY: Some devices return 0-byte reads; backoff prevents busy-loop CPU burn.
-                    try {
-                        Thread.sleep(backoffMs)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        return
-                    }
-                    if (DEBUG_LOGS) {
-                        val nowMs = System.currentTimeMillis()
-                        if (nowMs - lastZeroReadReportAtMs >= ZERO_READ_REPORT_INTERVAL_MS) {
-                            // WHY: Periodic sampling avoids log spam while surfacing busy-loop signals.
-                            Log.d(
-                                TAG,
-                                "packetLoop zeroReadCount=$zeroReadCount intervalMs=${nowMs - lastZeroReadReportAtMs}"
-                            )
-                            zeroReadCount = 0
-                            lastZeroReadReportAtMs = nowMs
-                        }
-                    }
-                    continue
-                }
-                if (zeroReadCount > 0) {
-                    zeroReadCount = 0
-                }
-                lastPacketAtMs = System.currentTimeMillis()
-                updateIdleModeIfNeeded("packet")
-                if (pendingNetworkReset) {
-                    pendingNetworkReset = false
-                    handleNetworkChange()
-                }
-                val outcome = processor.handlePacket(buffer, length) ?: continue
-                when (outcome) {
-                    is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
-                    is DnsPacketProcessor.Outcome.Upstream -> {
-                        // WHY: 短時間待機の offer(timeout) を入れて、キュー満杯時の即SERVFAILを減らす
-                        val offered = try {
-                            requestQueue.offer(outcome.job, REQUEST_QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)
-                        } catch (_: InterruptedException) {
-                            Thread.currentThread().interrupt()
-                            return
-                        }
-                        if (!offered) {
-                            // WHY: 読み取りスレッドを塞がないため、即時に失敗応答を返す。
-                            val responsePayload = processor.buildServfailResponse(outcome.job.query)
-                            val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
-                            enqueueResponse(responseQueue, response)
-                            val count = servfailCount.incrementAndGet()
-                            if (DEBUG_LOGS) {
-                                Log.d(TAG, "servfail fallback count=$count requestQueueSize=${requestQueue.size}")
-                            }
-                        }
-                    }
-                }
+            if (usePoll) {
+                runPacketLoopPoll(
+                    vpnInterface.fileDescriptor,
+                    wakeupPipe!!,
+                    buffer,
+                    processor,
+                    requestQueue,
+                    responseQueue
+                )
+                return
             }
+            runPacketLoopLegacy(input!!, buffer, processor, requestQueue, responseQueue)
         } finally {
             if (!stopSignal.get() || fatalStopRequested) {
-                Log.w(TAG, "VPN処理が中断したためサービスを終了します。")
+                Log.w(TAG, "VPN loop stopped unexpectedly; stopping service.")
                 stopVpn()
             }
         }
+    }
+
+    private fun runPacketLoopLegacy(
+        input: FileInputStream,
+        buffer: ByteArray,
+        processor: DnsPacketProcessor,
+        requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>,
+        responseQueue: BlockingQueue<ByteArray>
+    ) {
+        var zeroReadCount = 0L
+        var lastZeroReadReportAtMs = System.currentTimeMillis()
+        while (!stopSignal.get()) {
+            val length = try {
+                input.read(buffer)
+            } catch (error: IOException) {
+                Log.w(TAG, "VPN read failed: ${error.message}")
+                break
+            }
+            if (length < 0) {
+                Log.w(TAG, "VPN read returned EOF; stopping")
+                break
+            }
+            if (length == 0) {
+                zeroReadCount += 1
+                if (DEBUG_LOGS) {
+                    val nowMs = System.currentTimeMillis()
+                    if (nowMs - lastZeroReadReportAtMs >= ZERO_READ_REPORT_INTERVAL_MS) {
+                        // WHY: Periodic sampling avoids log spam while surfacing busy-loop signals.
+                        Log.d(
+                            TAG,
+                            "packetLoop zeroReadCount=$zeroReadCount intervalMs=${nowMs - lastZeroReadReportAtMs}"
+                        )
+                        zeroReadCount = 0
+                        lastZeroReadReportAtMs = nowMs
+                    }
+                }
+                continue
+            }
+            if (!handlePacketRead(length, buffer, processor, requestQueue, responseQueue)) {
+                return
+            }
+        }
+    }
+
+    private fun runPacketLoopPoll(
+        tunFd: FileDescriptor,
+        wakeupPipe: WakeupPipe,
+        buffer: ByteArray,
+        processor: DnsPacketProcessor,
+        requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>,
+        responseQueue: BlockingQueue<ByteArray>
+    ) {
+        val pollFds = arrayOf(
+            StructPollfd().apply {
+                fd = tunFd
+                events = (
+                    OsConstants.POLLIN or
+                        OsConstants.POLLERR or
+                        OsConstants.POLLHUP or
+                        OsConstants.POLLNVAL
+                    ).toShort()
+            },
+            StructPollfd().apply {
+                fd = wakeupPipe.readFd
+                events = (
+                    OsConstants.POLLIN or
+                        OsConstants.POLLERR or
+                        OsConstants.POLLHUP or
+                        OsConstants.POLLNVAL
+                    ).toShort()
+            }
+        )
+        val pollErrorMask = OsConstants.POLLERR or OsConstants.POLLHUP or OsConstants.POLLNVAL
+        var pollTimeouts = 0L
+        var pollWakeups = 0L
+        var pollTunReadable = 0L
+        var pollErrors = 0L
+        var readZeroAfterReadable = 0L
+        var lastPollReportAtMs = System.currentTimeMillis()
+
+        fun reportIfNeeded(nowMs: Long) {
+            if (!DEBUG_LOGS) return
+            if (nowMs - lastPollReportAtMs < ZERO_READ_REPORT_INTERVAL_MS) return
+            Log.d(
+                TAG,
+                "packetLoop pollStats timeouts=$pollTimeouts wakeups=$pollWakeups " +
+                    "tunReadable=$pollTunReadable errors=$pollErrors " +
+                    "readZeroAfterReadable=$readZeroAfterReadable " +
+                    "intervalMs=${nowMs - lastPollReportAtMs}"
+            )
+            pollTimeouts = 0
+            pollWakeups = 0
+            pollTunReadable = 0
+            pollErrors = 0
+            readZeroAfterReadable = 0
+            lastPollReportAtMs = nowMs
+        }
+
+        while (!stopSignal.get()) {
+            val ready = try {
+                Os.poll(pollFds, POLL_TIMEOUT_MS)
+            } catch (error: ErrnoException) {
+                if (error.errno == OsConstants.EINTR) {
+                    continue
+                }
+                Log.w(TAG, "poll failed errno=${error.errno}")
+                break
+            }
+            val nowMs = System.currentTimeMillis()
+            if (ready == 0) {
+                pollTimeouts += 1
+                reportIfNeeded(nowMs)
+                continue
+            }
+            val controlRevents = pollFds[1].revents.toInt()
+            if (controlRevents and pollErrorMask != 0) {
+                pollErrors += 1
+                Log.w(TAG, "poll ctrl error revents=$controlRevents")
+                break
+            }
+            if (controlRevents and OsConstants.POLLIN != 0) {
+                pollWakeups += 1
+                try {
+                    wakeupPipe.drain()
+                } catch (error: ErrnoException) {
+                    Log.w(TAG, "wakeup drain failed errno=${error.errno}")
+                    break
+                }
+            }
+            val tunRevents = pollFds[0].revents.toInt()
+            if (tunRevents and pollErrorMask != 0) {
+                pollErrors += 1
+                Log.w(TAG, "poll tun error revents=$tunRevents")
+                break
+            }
+            if (tunRevents and OsConstants.POLLIN != 0) {
+                pollTunReadable += 1
+                val length = try {
+                    Os.read(tunFd, buffer, 0, buffer.size)
+                } catch (error: ErrnoException) {
+                    if (error.errno == OsConstants.EAGAIN || error.errno == OsConstants.EINTR) {
+                        reportIfNeeded(nowMs)
+                        continue
+                    }
+                    Log.w(TAG, "VPN read failed errno=${error.errno}")
+                    break
+                }
+                if (length <= 0) {
+                    readZeroAfterReadable += 1
+                } else {
+                    if (!handlePacketRead(length, buffer, processor, requestQueue, responseQueue)) {
+                        return
+                    }
+                }
+            }
+            reportIfNeeded(nowMs)
+        }
+    }
+
+    private fun handlePacketRead(
+        length: Int,
+        buffer: ByteArray,
+        processor: DnsPacketProcessor,
+        requestQueue: BlockingQueue<DnsPacketProcessor.UpstreamJob>,
+        responseQueue: BlockingQueue<ByteArray>
+    ): Boolean {
+        lastPacketAtMs = System.currentTimeMillis()
+        updateIdleModeIfNeeded("packet")
+        if (pendingNetworkReset) {
+            pendingNetworkReset = false
+            handleNetworkChange()
+        }
+        val outcome = processor.handlePacket(buffer, length) ?: return true
+        when (outcome) {
+            is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
+            is DnsPacketProcessor.Outcome.Upstream -> {
+                // WHY: Bound the offer wait to keep latency predictable under load.
+                val offered = try {
+                    requestQueue.offer(outcome.job, REQUEST_QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+                if (!offered) {
+                    // WHY: Prefer timely SERVFAIL over long queue backlogs.
+                    val responsePayload = processor.buildServfailResponse(outcome.job.query)
+                    val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
+                    enqueueResponse(responseQueue, response)
+                    val count = servfailCount.incrementAndGet()
+                    if (DEBUG_LOGS) {
+                        Log.d(TAG, "servfail fallback count=$count requestQueueSize=${requestQueue.size}")
+                    }
+                }
+            }
+        }
+        return true
     }
 
     private fun startResponseWriter(
@@ -859,6 +1022,7 @@ class DnsVpnService : VpnService() {
         // WHY: Ensure the read loop observes a fatal stop after responseWriter failures.
         fatalStopRequested = true
         stopSignal.set(true)
+        wakeupPipe?.wake()
         try {
             vpnFd?.close()
         } catch (closeError: IOException) {
@@ -868,6 +1032,46 @@ class DnsVpnService : VpnService() {
         val worker = workerThread
         if (worker == null || !worker.isAlive) {
             stopVpn()
+        }
+    }
+
+    private class WakeupPipe private constructor(
+        val readFd: FileDescriptor,
+        val writeFd: FileDescriptor
+    ) {
+        fun wake() {
+            try {
+                Os.write(writeFd, WAKE_SIGNAL, 0, WAKE_SIGNAL.size)
+            } catch (_: ErrnoException) {
+                // WHY: Best-effort wake; poll timeout provides a fallback.
+            }
+        }
+
+        @Throws(ErrnoException::class)
+        fun drain() {
+            val buffer = ByteArray(WAKE_DRAIN_BUFFER_SIZE)
+            Os.read(readFd, buffer, 0, buffer.size)
+        }
+
+        fun close() {
+            try {
+                Os.close(readFd)
+            } catch (_: ErrnoException) {
+            }
+            try {
+                Os.close(writeFd)
+            } catch (_: ErrnoException) {
+            }
+        }
+
+        companion object {
+            fun create(): WakeupPipe {
+                val fds = Os.pipe()
+                return WakeupPipe(fds[0], fds[1])
+            }
+
+            private val WAKE_SIGNAL = byteArrayOf(1)
+            private const val WAKE_DRAIN_BUFFER_SIZE = 32
         }
     }
 
@@ -908,8 +1112,10 @@ class DnsVpnService : VpnService() {
         // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
         private const val DNS_CACHE_MAX_ENTRIES = 1024
         private const val DNS_CACHE_TTL_MS = 60000L
-        private const val ZERO_READ_MAX_SLEEP_MS = 20L
         private const val ZERO_READ_REPORT_INTERVAL_MS = 1000L
+        // NOTE: Set false to fall back to the legacy FileInputStream read loop.
+        private const val USE_POLL_LOOP = true
+        private const val POLL_TIMEOUT_MS = 1000
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
@@ -941,6 +1147,7 @@ class DnsVpnService : VpnService() {
     private var responseQueue: BlockingQueue<ByteArray>? = null
     private var dnsCache: DnsCache? = null
     private var metrics: DnsMetrics = DnsMetrics(false)
+    private var wakeupPipe: WakeupPipe? = null
     private var screenStateReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
