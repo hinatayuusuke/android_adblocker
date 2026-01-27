@@ -256,6 +256,14 @@ class DnsVpnService : VpnService() {
                 }
                 if (length == 0) {
                     zeroReadCount += 1
+                    val backoffMs = minOf(ZERO_READ_MAX_SLEEP_MS, zeroReadCount)
+                    // WHY: Some devices return 0-byte reads; backoff prevents busy-loop CPU burn.
+                    try {
+                        Thread.sleep(backoffMs)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return
+                    }
                     if (DEBUG_LOGS) {
                         val nowMs = System.currentTimeMillis()
                         if (nowMs - lastZeroReadReportAtMs >= ZERO_READ_REPORT_INTERVAL_MS) {
@@ -269,6 +277,9 @@ class DnsVpnService : VpnService() {
                         }
                     }
                     continue
+                }
+                if (zeroReadCount > 0) {
+                    zeroReadCount = 0
                 }
                 lastPacketAtMs = System.currentTimeMillis()
                 updateIdleModeIfNeeded("packet")
@@ -897,6 +908,7 @@ class DnsVpnService : VpnService() {
         // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
         private const val DNS_CACHE_MAX_ENTRIES = 1024
         private const val DNS_CACHE_TTL_MS = 60000L
+        private const val ZERO_READ_MAX_SLEEP_MS = 20L
         private const val ZERO_READ_REPORT_INTERVAL_MS = 1000L
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
