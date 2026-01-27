@@ -842,13 +842,14 @@ class DnsVpnService : VpnService() {
         private const val DNS_SERVER_INT = 0x0A000001
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
-        private const val UPSTREAM_WORKER_COUNT = 6
+        // PERF: Lower default concurrency to reduce idle thread overhead.
+        private const val UPSTREAM_WORKER_COUNT = 2
         private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 20
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
-        private const val RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS = 5000L
-        private const val RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS = 60000L
+        private const val RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS = 60000L
+        private const val RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS = 120000L
         // WHY: Require sustained idle before switching to long waits.
         private const val RESPONSE_WATCHDOG_IDLE_ENTER_MS = 3000L
         private const val RESPONSE_WRITE_STALL_MS = 15000L
