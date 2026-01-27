@@ -155,17 +155,23 @@ class DnsVpnService : VpnService() {
 
         isRunning = true
 
-        workerThread = Thread {
-            runPacketLoop(vpnInterface, sockets, matcher, metrics)
-        }.apply { start() }
+        workerThread = Thread(
+            {
+                runPacketLoop(vpnInterface, sockets, matcher, metrics)
+            },
+            "packetLoop"
+        ).apply { start() }
 
         // WHY: FGS開始猶予を超えないよう、重いブロックリスト読込は別スレッドで行う。
-        Thread {
-            val blocklist = BlocklistLoader.load(applicationContext, BLOCKLIST_ASSET)
-            if (!stopSignal.get()) {
-                matcher.updateBlocklist(blocklist)
-            }
-        }.start()
+        Thread(
+            {
+                val blocklist = BlocklistLoader.load(applicationContext, BLOCKLIST_ASSET)
+                if (!stopSignal.get()) {
+                    matcher.updateBlocklist(blocklist)
+                }
+            },
+            "blocklistLoader"
+        ).start()
     }
 
     private fun stopVpn() {
@@ -234,6 +240,8 @@ class DnsVpnService : VpnService() {
         startResponseWatchdog(metrics)
         startUpstreamWorkers(sockets, requestQueue, responseQueue, processor, metrics)
 
+        var zeroReadCount = 0L
+        var lastZeroReadReportAtMs = System.currentTimeMillis()
         try {
             while (!stopSignal.get()) {
                 val length = try {
@@ -246,7 +254,22 @@ class DnsVpnService : VpnService() {
                     Log.w(TAG, "VPN読み込みが終了したため停止します。")
                     break
                 }
-                if (length == 0) continue
+                if (length == 0) {
+                    zeroReadCount += 1
+                    if (DEBUG_LOGS) {
+                        val nowMs = System.currentTimeMillis()
+                        if (nowMs - lastZeroReadReportAtMs >= ZERO_READ_REPORT_INTERVAL_MS) {
+                            // WHY: Periodic sampling avoids log spam while surfacing busy-loop signals.
+                            Log.d(
+                                TAG,
+                                "packetLoop zeroReadCount=$zeroReadCount intervalMs=${nowMs - lastZeroReadReportAtMs}"
+                            )
+                            zeroReadCount = 0
+                            lastZeroReadReportAtMs = nowMs
+                        }
+                    }
+                    continue
+                }
                 lastPacketAtMs = System.currentTimeMillis()
                 updateIdleModeIfNeeded("packet")
                 if (pendingNetworkReset) {
@@ -316,7 +339,10 @@ class DnsVpnService : VpnService() {
                     break
                 }
             }
-        }.apply { start() }
+        }.apply {
+            name = "responseWriter"
+            start()
+        }
     }
 
     private fun startResponseWatchdog(metrics: DnsMetrics) {
@@ -366,7 +392,10 @@ class DnsVpnService : VpnService() {
                     break
                 }
             }
-        }.apply { start() }
+        }.apply {
+            name = "responseWatchdog"
+            start()
+        }
     }
 
     private fun startUpstreamWorkers(
@@ -376,7 +405,7 @@ class DnsVpnService : VpnService() {
         processor: DnsPacketProcessor,
         metrics: DnsMetrics
     ) {
-        upstreamWorkers = sockets.map { socket ->
+        upstreamWorkers = sockets.mapIndexed { index, socket ->
             Thread {
                 val resolver = UpstreamResolver(socket, UPSTREAM_DNS, metrics)
                 var consecutiveFailures = 0
@@ -437,7 +466,10 @@ class DnsVpnService : VpnService() {
                     }
                     enqueueResponse(responseQueue, response)
                 }
-            }.apply { start() }
+            }.apply {
+                name = "upstreamWorker#$index"
+                start()
+            }
         }
     }
 
@@ -842,12 +874,12 @@ class DnsVpnService : VpnService() {
         private const val DNS_SERVER_INT = 0x0A000001
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
-        private const val UPSTREAM_WORKER_COUNT = 6
+        private const val UPSTREAM_WORKER_COUNT = 2
         private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 20
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
-        private const val RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS = 5000L
+        private const val RESPONSE_WATCHDOG_ACTIVE_INTERVAL_MS = 10000L
         private const val RESPONSE_WATCHDOG_EMPTY_INTERVAL_MS = 60000L
         // WHY: Require sustained idle before switching to long waits.
         private const val RESPONSE_WATCHDOG_IDLE_ENTER_MS = 3000L
@@ -865,6 +897,7 @@ class DnsVpnService : VpnService() {
         // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
         private const val DNS_CACHE_MAX_ENTRIES = 1024
         private const val DNS_CACHE_TTL_MS = 60000L
+        private const val ZERO_READ_REPORT_INTERVAL_MS = 1000L
         private val DEBUG_LOGS = BuildConfig.DEBUG
 
         @Volatile
