@@ -41,9 +41,13 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.BlockingQueue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 目的: 端末内でDNSクエリのみを処理するVPNサービスを提供する。
@@ -87,6 +91,8 @@ class DnsVpnService : VpnService() {
      */
     override fun onDestroy() {
         stopVpn()
+        resetScheduler?.shutdownNow()
+        resetScheduler = null
         super.onDestroy()
     }
 
@@ -132,6 +138,9 @@ class DnsVpnService : VpnService() {
         startScreenMonitor()
         val sockets = createUpstreamSockets(currentNetwork)
         if (sockets.isEmpty()) {
+            val caps = connectivityManager?.getNetworkCapabilities(currentNetwork)
+            val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            Log.w(TAG, "Upstream socket creation failed on start; network=$currentNetwork validated=$validated")
             stopScreenMonitor()
             stopNetworkMonitor()
             vpnInterface.close()
@@ -147,6 +156,8 @@ class DnsVpnService : VpnService() {
         lastResponseWriteAtMs = 0
         pendingNetworkReset = false
         lastTunStallResetAtMs = 0
+        lastUpstreamSendAtMs = 0
+        resetBackoffMs.set(0)
         val metrics = DnsMetrics(DEBUG_LOGS)
         this.metrics = metrics
         dnsCache = DnsCache(DNS_CACHE_MAX_ENTRIES, DNS_CACHE_TTL_MS)
@@ -193,6 +204,11 @@ class DnsVpnService : VpnService() {
         lastPacketAtMs = 0
         pendingNetworkReset = false
         lastTunStallResetAtMs = 0
+        lastUpstreamSendAtMs = 0
+        resetBackoffMs.set(0)
+        resetPending.set(false)
+        resetInFlight.set(false)
+        resetRetryScheduled.set(false)
         stopNetworkMonitor()
         stopScreenMonitor()
         val worker = workerThread
@@ -220,6 +236,7 @@ class DnsVpnService : VpnService() {
         responseQueue = null
         metrics = DnsMetrics(false)
         dnsCache = null
+        lastPacketAtMs = 0
         lastResponseWriteAtMs = 0
         lastResponseEnqueueAtMs = 0
         responseWriterStallCount.set(0)
@@ -227,20 +244,6 @@ class DnsVpnService : VpnService() {
         stopForeground(true)
         isRunning = false
         stopSelf()
-    }
-
-    private fun reloadAllowlist() {
-        ruleMatcher?.updateAllowlist(loadAllowlist())
-    }
-
-    private fun createWakeupPipe(): WakeupPipe? {
-        return try {
-            WakeupPipe.create()
-        } catch (error: Exception) {
-            // WHY: Fall back to legacy loop if the control pipe cannot be created.
-            Log.w(TAG, "Wakeup pipe create failed: ${error.message}")
-            null
-        }
     }
 
     private fun runPacketLoop(
@@ -459,7 +462,7 @@ class DnsVpnService : VpnService() {
         updateIdleModeIfNeeded("packet")
         if (pendingNetworkReset) {
             pendingNetworkReset = false
-            handleNetworkChange()
+            scheduleNetworkReset(forceImmediate = true)
         }
         val outcome = processor.handlePacket(buffer, length) ?: return true
         when (outcome) {
@@ -625,6 +628,7 @@ class DnsVpnService : VpnService() {
                             break
                         }
                     }
+                    lastUpstreamSendAtMs = nowMs
                     val resolvedPayload = resolver.resolve(job.queryPayload)
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1
@@ -789,7 +793,9 @@ class DnsVpnService : VpnService() {
     private fun startNetworkMonitor() {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         currentNetwork = selectUpstreamNetwork(manager)
-        currentNetworkValidated = getNetworkValidated(manager, currentNetwork)
+        getNetworkValidated(manager, currentNetwork)?.let { validated ->
+            currentNetwork?.let { networkValidated[it] = validated }
+        }
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 lastNetworkAvailableAtMs = System.currentTimeMillis()
@@ -798,6 +804,7 @@ class DnsVpnService : VpnService() {
 
             override fun onLost(network: Network) {
                 lastNetworkLostAtMs = System.currentTimeMillis()
+                networkValidated.remove(network)
                 updateCurrentNetwork("lost")
             }
 
@@ -812,10 +819,9 @@ class DnsVpnService : VpnService() {
                         "caps changed network=$network validated=$validated internet=$hasInternet"
                     )
                 }
-                val wasValidated = if (network == currentNetwork) currentNetworkValidated else null
+                val wasValidated = networkValidated.put(network, validated)
                 updateCurrentNetwork("capabilities")
                 if (network == currentNetwork) {
-                    currentNetworkValidated = validated
                     if (wasValidated == false && validated) {
                         Log.i(TAG, "Network validated again; forcing VPN reset network=$network")
                         scheduleNetworkReset(forceImmediate = true)
@@ -843,7 +849,7 @@ class DnsVpnService : VpnService() {
         connectivityManager = null
         networkCallback = null
         currentNetwork = null
-        currentNetworkValidated = null
+        networkValidated.clear()
         lastNetworkAvailableAtMs = 0
         lastNetworkLostAtMs = 0
     }
@@ -854,7 +860,9 @@ class DnsVpnService : VpnService() {
         if (currentNetwork == selected) return
         // WHY: Avoid binding upstream sockets to VPN transport networks.
         currentNetwork = selected
-        currentNetworkValidated = getNetworkValidated(manager, selected)
+        getNetworkValidated(manager, selected)?.let { validated ->
+            selected?.let { networkValidated[it] = validated }
+        }
         if (DEBUG_LOGS) {
             Log.d(TAG, "Upstream network updated reason=$reason selected=$selected")
         }
@@ -890,7 +898,7 @@ class DnsVpnService : VpnService() {
         if (!isRunning || stopSignal.get()) return
         if (forceImmediate) {
             pendingNetworkReset = false
-            handleNetworkChange()
+            enqueueNetworkReset()
             return
         }
         val lastActiveAtMs = lastPacketAtMs
@@ -899,20 +907,88 @@ class DnsVpnService : VpnService() {
             (nowMs - lastActiveAtMs) <= NETWORK_IDLE_RESET_THRESHOLD_MS
         if (isActive) {
             pendingNetworkReset = false
-            handleNetworkChange()
+            enqueueNetworkReset()
             return
         }
         // WHY: Defer socket resets while idle to avoid waking workers on churn.
         pendingNetworkReset = true
     }
 
+    private fun enqueueNetworkReset() {
+        if (!isRunning || stopSignal.get()) return
+        resetPending.set(true)
+        if (resetInFlight.get()) return
+        val scheduler = getResetScheduler()
+        scheduler.execute {
+            runNetworkReset()
+        }
+    }
+
+    private fun scheduleNetworkResetDelayed(delayMs: Long) {
+        if (!isRunning || stopSignal.get()) return
+        if (!resetRetryScheduled.compareAndSet(false, true)) return
+        val scheduler = getResetScheduler()
+        scheduler.schedule(
+            {
+                resetRetryScheduled.set(false)
+                scheduleNetworkReset(forceImmediate = true)
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun computeResetBackoffMs(): Long {
+        val previous = resetBackoffMs.get()
+        val next = if (previous <= 0) {
+            RESET_RETRY_BASE_MS
+        } else {
+            (previous * 2).coerceAtMost(RESET_RETRY_MAX_MS)
+        }
+        resetBackoffMs.set(next)
+        return next
+    }
+
+    private fun runNetworkReset() {
+        if (!resetInFlight.compareAndSet(false, true)) return
+        try {
+            while (resetPending.getAndSet(false)) {
+                handleNetworkChange()
+                if (!isRunning || stopSignal.get()) {
+                    return
+                }
+            }
+        } finally {
+            resetInFlight.set(false)
+        }
+    }
+
+    private fun getResetScheduler(): ScheduledExecutorService {
+        val existing = resetScheduler
+        if (existing != null) return existing
+        synchronized(resetSchedulerLock) {
+            val current = resetScheduler
+            if (current != null) return current
+            val created = Executors.newSingleThreadScheduledExecutor { runnable ->
+                Thread(runnable, "networkReset").apply { isDaemon = true }
+            }
+            resetScheduler = created
+            return created
+        }
+    }
+
     private fun maybeTriggerTunStallReset(nowMs: Long) {
         if (!isRunning || stopSignal.get()) return
+        if (isIdleMode) return
         if (!hasUpstreamNetwork()) return
         val lastPacketMs = lastPacketAtMs
         if (lastPacketMs <= 0) return
         val idleMs = nowMs - lastPacketMs
         if (idleMs < TUN_STALL_RESET_MS) return
+        val lastUpstreamMs = lastUpstreamSendAtMs
+        val hasRecentUpstream = lastUpstreamMs > 0 &&
+            (nowMs - lastUpstreamMs) <= TUN_STALL_RECENT_UPSTREAM_MS
+        if (!screenInteractive && !hasRecentUpstream) return
         val lastResetMs = lastTunStallResetAtMs
         if (lastResetMs > 0 && nowMs - lastResetMs < TUN_STALL_RESET_COOLDOWN_MS) return
         lastTunStallResetAtMs = nowMs
@@ -952,13 +1028,19 @@ class DnsVpnService : VpnService() {
         }
         synchronized(upstreamResetLock) {
             if (!isRunning || stopSignal.get()) return
-            // WHY: 旧経路の滞留を残さず復旧後詰まりを減らす。
+            val sockets = createUpstreamSockets(currentNetwork)
+            if (sockets.isEmpty()) {
+                val delayMs = computeResetBackoffMs()
+                Log.w(TAG, "Upstream socket creation failed; retrying in ${delayMs}ms")
+                scheduleNetworkResetDelayed(delayMs)
+                return
+            }
+            resetBackoffMs.set(0)
+            // WHY: Clear queues to drop stale requests before switching sockets.
             currentResponseQueue.clear()
             // WHY: Stale requests after network switches are likely obsolete; drop to reduce latency.
             currentRequestQueue.clear()
             shutdownUpstreamLocked()
-            val sockets = createUpstreamSockets(currentNetwork)
-            if (sockets.isEmpty()) return
             upstreamSockets = sockets
             startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor, metrics)
         }
@@ -971,6 +1053,7 @@ class DnsVpnService : VpnService() {
                 soTimeout = UPSTREAM_TIMEOUT_MS
             }
             if (!protect(socket)) {
+                Log.w(TAG, "Failed to protect upstream socket; network=$network")
                 socket.close()
                 sockets.forEach { it.close() }
                 return emptyList()
@@ -1179,6 +1262,9 @@ class DnsVpnService : VpnService() {
         private const val FATAL_RESTART_COOLDOWN_MS = 15000L
         private const val TUN_STALL_RESET_MS = 30_000L
         private const val TUN_STALL_RESET_COOLDOWN_MS = 30_000L
+        private const val TUN_STALL_RECENT_UPSTREAM_MS = 30_000L
+        private const val RESET_RETRY_BASE_MS = 2000L
+        private const val RESET_RETRY_MAX_MS = 15000L
         // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
         private const val DNS_CACHE_MAX_ENTRIES = 1024
         private const val DNS_CACHE_TTL_MS = 60000L
@@ -1224,6 +1310,7 @@ class DnsVpnService : VpnService() {
     private var powerManager: PowerManager? = null
     @Volatile
     private var currentNetwork: Network? = null
+    private val networkValidated = ConcurrentHashMap<Network, Boolean>()
     @Volatile
     private var isIdleMode: Boolean = false
     @Volatile
@@ -1245,9 +1332,16 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var pendingNetworkReset: Boolean = false
     @Volatile
-    private var currentNetworkValidated: Boolean? = null
-    @Volatile
     private var lastTunStallResetAtMs: Long = 0
+    @Volatile
+    private var lastUpstreamSendAtMs: Long = 0
+    private val resetPending = AtomicBoolean(false)
+    private val resetInFlight = AtomicBoolean(false)
+    private val resetRetryScheduled = AtomicBoolean(false)
+    private val resetBackoffMs = AtomicLong(0)
+    private val resetSchedulerLock = Any()
+    @Volatile
+    private var resetScheduler: ScheduledExecutorService? = null
     @Volatile
     private var fatalStopRequested: Boolean = false
     private val responseWatchdogLock = Any()
