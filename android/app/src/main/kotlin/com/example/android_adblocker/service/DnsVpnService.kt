@@ -137,14 +137,11 @@ class DnsVpnService : VpnService() {
         startNetworkMonitor()
         startScreenMonitor()
         val sockets = createUpstreamSockets(currentNetwork)
-        if (sockets.isEmpty()) {
+        val startWithoutUpstream = sockets.isEmpty()
+        if (startWithoutUpstream) {
             val caps = connectivityManager?.getNetworkCapabilities(currentNetwork)
             val validated = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
             Log.w(TAG, "Upstream socket creation failed on start; network=$currentNetwork validated=$validated")
-            stopScreenMonitor()
-            stopNetworkMonitor()
-            vpnInterface.close()
-            return
         }
 
         vpnFd = vpnInterface
@@ -158,6 +155,10 @@ class DnsVpnService : VpnService() {
         lastTunStallResetAtMs = 0
         lastUpstreamSendAtMs = 0
         resetBackoffMs.set(0)
+        resetPending.set(false)
+        resetInFlight.set(false)
+        resetRetryScheduled.set(false)
+        resetCoalesceScheduled.set(false)
         val metrics = DnsMetrics(DEBUG_LOGS)
         this.metrics = metrics
         dnsCache = DnsCache(DNS_CACHE_MAX_ENTRIES, DNS_CACHE_TTL_MS)
@@ -184,6 +185,12 @@ class DnsVpnService : VpnService() {
             },
             "packetLoop"
         ).apply { start() }
+
+        if (startWithoutUpstream) {
+            val delayMs = computeResetBackoffMs()
+            Log.w(TAG, "Upstream unavailable at start; scheduling reset in ${delayMs}ms")
+            scheduleNetworkResetDelayed(delayMs)
+        }
 
         // WHY: FGS開始猶予を超えないよう、重いブロックリスト読込は別スレッドで行う。
         Thread(
@@ -244,6 +251,20 @@ class DnsVpnService : VpnService() {
         stopForeground(true)
         isRunning = false
         stopSelf()
+    }
+
+    private fun reloadAllowlist() {
+        ruleMatcher?.updateAllowlist(loadAllowlist())
+    }
+
+    private fun createWakeupPipe(): WakeupPipe? {
+        return try {
+            WakeupPipe.create()
+        } catch (error: Exception) {
+            // WHY: Fall back to legacy loop if the control pipe cannot be created.
+            Log.w(TAG, "Wakeup pipe create failed: ${error.message}")
+            null
+        }
     }
 
     private fun runPacketLoop(
@@ -468,6 +489,16 @@ class DnsVpnService : VpnService() {
         when (outcome) {
             is DnsPacketProcessor.Outcome.Immediate -> enqueueResponse(responseQueue, outcome.response)
             is DnsPacketProcessor.Outcome.Upstream -> {
+                if (upstreamSockets.isEmpty()) {
+                    val responsePayload = processor.buildServfailResponse(outcome.job.query)
+                    val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
+                    enqueueResponse(responseQueue, response)
+                    val count = servfailCount.incrementAndGet()
+                    if (DEBUG_LOGS) {
+                        Log.d(TAG, "servfail no-upstream count=$count requestQueueSize=${requestQueue.size}")
+                    }
+                    return true
+                }
                 // WHY: Bound the offer wait to keep latency predictable under load.
                 val offered = try {
                     requestQueue.offer(outcome.job, REQUEST_QUEUE_WAIT_MS, TimeUnit.MILLISECONDS)
@@ -898,7 +929,7 @@ class DnsVpnService : VpnService() {
         if (!isRunning || stopSignal.get()) return
         if (forceImmediate) {
             pendingNetworkReset = false
-            enqueueNetworkReset()
+            enqueueNetworkResetCoalesced()
             return
         }
         val lastActiveAtMs = lastPacketAtMs
@@ -922,6 +953,22 @@ class DnsVpnService : VpnService() {
         scheduler.execute {
             runNetworkReset()
         }
+    }
+
+    private fun enqueueNetworkResetCoalesced() {
+        if (!isRunning || stopSignal.get()) return
+        resetPending.set(true)
+        if (resetInFlight.get()) return
+        if (!resetCoalesceScheduled.compareAndSet(false, true)) return
+        val scheduler = getResetScheduler()
+        scheduler.schedule(
+            {
+                resetCoalesceScheduled.set(false)
+                enqueueNetworkReset()
+            },
+            FORCE_RESET_COALESCE_MS,
+            TimeUnit.MILLISECONDS
+        )
     }
 
     private fun scheduleNetworkResetDelayed(delayMs: Long) {
@@ -1263,6 +1310,7 @@ class DnsVpnService : VpnService() {
         private const val TUN_STALL_RESET_MS = 30_000L
         private const val TUN_STALL_RESET_COOLDOWN_MS = 30_000L
         private const val TUN_STALL_RECENT_UPSTREAM_MS = 30_000L
+        private const val FORCE_RESET_COALESCE_MS = 300L
         private const val RESET_RETRY_BASE_MS = 2000L
         private const val RESET_RETRY_MAX_MS = 15000L
         // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
@@ -1338,6 +1386,7 @@ class DnsVpnService : VpnService() {
     private val resetPending = AtomicBoolean(false)
     private val resetInFlight = AtomicBoolean(false)
     private val resetRetryScheduled = AtomicBoolean(false)
+    private val resetCoalesceScheduled = AtomicBoolean(false)
     private val resetBackoffMs = AtomicLong(0)
     private val resetSchedulerLock = Any()
     @Volatile
