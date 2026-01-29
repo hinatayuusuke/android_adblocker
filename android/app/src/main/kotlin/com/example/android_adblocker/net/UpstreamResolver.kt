@@ -32,11 +32,12 @@ internal class UpstreamResolver(
             // WHY: 受信後に縮んだlengthを戻さないと応答が途中で切れる。
             responsePacket.length = responseBuffer.size
             socket.receive(responsePacket)
+            val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
             if (DEBUG_LOGS) {
-                val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
                 Log.d(TAG, "upstream recv after length=${responsePacket.length} elapsedMs=$elapsedMs")
             }
-            metrics.onUpstreamSuccess()
+            val nowMs = System.currentTimeMillis()
+            metrics.onUpstreamSuccess(elapsedMs, nowMs)
             responseView.length = responsePacket.length
             responseView
         } catch (_: IOException) {

@@ -78,6 +78,7 @@ class DnsVpnService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> stopVpn()
             ACTION_RELOAD_RULES -> reloadAllowlist()
+            ACTION_DIAG -> logDiagnosticSnapshot("intent")
             else -> startVpn()
         }
         return START_STICKY
@@ -154,6 +155,21 @@ class DnsVpnService : VpnService() {
         pendingNetworkReset = false
         lastTunStallResetAtMs = 0
         lastUpstreamSendAtMs = 0
+        lastTunPacketAtMs = 0
+        lastTunStatsReportAtMs = 0
+        tunPacketsInWindow.set(0)
+        tunReadableCount.set(0)
+        tunReadZeroCount.set(0)
+        upstreamConsecutiveFailures.set(0)
+        lastUpstreamSuccessAtMs.set(0)
+        lastUpstreamFailureAtMs.set(0)
+        resetSequence.set(0)
+        resetCount.set(0)
+        lastResetReason = STATE_STOPPED
+        lastResetAtMs = 0
+        currentState = STATE_STOPPED
+        lastStateChangeAtMs = 0
+        upstreamCreateAttempt.set(0)
         resetBackoffMs.set(0)
         resetPending.set(false)
         resetInFlight.set(false)
@@ -187,9 +203,12 @@ class DnsVpnService : VpnService() {
         ).apply { start() }
 
         if (startWithoutUpstream) {
+            updateState(STATE_WAIT_RETRY, "start_no_upstream")
             val delayMs = computeResetBackoffMs()
             Log.w(TAG, "Upstream unavailable at start; scheduling reset in ${delayMs}ms")
-            scheduleNetworkResetDelayed(delayMs)
+            scheduleNetworkResetDelayed("start_no_upstream", delayMs)
+        } else {
+            updateState(STATE_RUNNING_OK, "start")
         }
 
         // WHY: FGS開始猶予を超えないよう、重いブロックリスト読込は別スレッドで行う。
@@ -212,6 +231,18 @@ class DnsVpnService : VpnService() {
         pendingNetworkReset = false
         lastTunStallResetAtMs = 0
         lastUpstreamSendAtMs = 0
+        lastTunPacketAtMs = 0
+        lastTunStatsReportAtMs = 0
+        tunPacketsInWindow.set(0)
+        tunReadableCount.set(0)
+        tunReadZeroCount.set(0)
+        upstreamConsecutiveFailures.set(0)
+        lastUpstreamSuccessAtMs.set(0)
+        lastUpstreamFailureAtMs.set(0)
+        lastResetReason = STATE_STOPPED
+        lastResetAtMs = 0
+        resetCount.set(0)
+        resetSequence.set(0)
         resetBackoffMs.set(0)
         resetPending.set(false)
         resetInFlight.set(false)
@@ -249,6 +280,7 @@ class DnsVpnService : VpnService() {
         responseWriterStallCount.set(0)
         fatalStopRequested = false
         stopForeground(true)
+        updateState(STATE_STOPPED, "stop")
         isRunning = false
         stopSelf()
     }
@@ -346,9 +378,16 @@ class DnsVpnService : VpnService() {
                         lastZeroReadReportAtMs = nowMs
                     }
                 }
+                val nowMs = System.currentTimeMillis()
+                recordTunRead(length, nowMs)
+                maybeReportTunStats(nowMs, "legacy")
                 try { Thread.sleep(100) } catch (_: InterruptedException) { break }
                 continue
             }
+            val nowMs = System.currentTimeMillis()
+            tunReadableCount.incrementAndGet()
+            recordTunRead(length, nowMs)
+            maybeReportTunStats(nowMs, "legacy")
             if (!handlePacketRead(length, buffer, processor, requestQueue, responseQueue)) {
                 return
             }
@@ -423,6 +462,7 @@ class DnsVpnService : VpnService() {
             if (ready == 0) {
                 pollTimeouts += 1
                 reportIfNeeded(nowMs)
+                maybeReportTunStats(nowMs, "poll")
                 maybeTriggerTunStallReset(nowMs)
                 continue
             }
@@ -449,11 +489,13 @@ class DnsVpnService : VpnService() {
             }
             if (tunRevents and OsConstants.POLLIN != 0) {
                 pollTunReadable += 1
+                tunReadableCount.incrementAndGet()
                 val length = try {
                     Os.read(tunFd, buffer, 0, buffer.size)
                 } catch (error: ErrnoException) {
                     if (error.errno == OsConstants.EAGAIN || error.errno == OsConstants.EINTR) {
                         reportIfNeeded(nowMs)
+                        maybeReportTunStats(nowMs, "poll")
                         continue
                     }
                     Log.w(TAG, "VPN read failed errno=${error.errno}")
@@ -461,13 +503,16 @@ class DnsVpnService : VpnService() {
                 }
                 if (length <= 0) {
                     readZeroAfterReadable += 1
+                    recordTunRead(length, nowMs)
                 } else {
+                    recordTunRead(length, nowMs)
                     if (!handlePacketRead(length, buffer, processor, requestQueue, responseQueue)) {
                         return
                     }
                 }
             }
             reportIfNeeded(nowMs)
+            maybeReportTunStats(nowMs, "poll")
             maybeTriggerTunStallReset(nowMs)
         }
     }
@@ -483,7 +528,7 @@ class DnsVpnService : VpnService() {
         updateIdleModeIfNeeded("packet")
         if (pendingNetworkReset) {
             pendingNetworkReset = false
-            scheduleNetworkReset(forceImmediate = true)
+            requestNetworkReset("pending_network_reset", forceImmediate = true)
         }
         val outcome = processor.handlePacket(buffer, length) ?: return true
         when (outcome) {
@@ -661,16 +706,26 @@ class DnsVpnService : VpnService() {
                     }
                     lastUpstreamSendAtMs = nowMs
                     val resolvedPayload = resolver.resolve(job.queryPayload)
+                    val finishMs = System.currentTimeMillis()
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1
+                        upstreamConsecutiveFailures.set(consecutiveFailures)
+                        lastUpstreamFailureAtMs.set(finishMs)
                         if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
                             // WHY: Detect stuck upstream and trigger a network reset recovery.
                             consecutiveFailures = 0
+                            upstreamConsecutiveFailures.set(0)
+                            updateState(STATE_UPSTREAM_DOWN, "upstream_failures")
                             Log.w(TAG, "Upstream failures reached $UPSTREAM_FAILURE_RESET_THRESHOLD; scheduling reset")
-                            scheduleNetworkReset()
+                            requestNetworkReset("upstream_failures")
                         }
                     } else {
-                        consecutiveFailures = 0
+                        if (consecutiveFailures > 0) {
+                            consecutiveFailures = 0
+                            upstreamConsecutiveFailures.set(0)
+                            updateState(STATE_RUNNING_OK, "upstream_recovered")
+                        }
+                        lastUpstreamSuccessAtMs.set(finishMs)
                     }
                     val response = if (resolvedPayload == null) {
                         val responsePayload = processor.buildServfailResponse(job.query)
@@ -812,6 +867,156 @@ class DnsVpnService : VpnService() {
         }
     }
 
+    private fun recordTunRead(length: Int, nowMs: Long) {
+        if (length > 0) {
+            tunPacketsInWindow.incrementAndGet()
+            lastTunPacketAtMs = nowMs
+        } else {
+            tunReadZeroCount.incrementAndGet()
+        }
+    }
+
+    private fun maybeReportTunStats(nowMs: Long, source: String) {
+        if (!DEBUG_LOGS) return
+        if (lastTunStatsReportAtMs == 0L) {
+            lastTunStatsReportAtMs = nowMs
+            return
+        }
+        val elapsedMs = nowMs - lastTunStatsReportAtMs
+        if (elapsedMs < TUN_STATS_REPORT_INTERVAL_MS) return
+        val tunPkts = tunPacketsInWindow.getAndSet(0)
+        val tunReadable = tunReadableCount.getAndSet(0)
+        val readZero = tunReadZeroCount.getAndSet(0)
+        val lastTunAgoMs = if (lastTunPacketAtMs > 0) nowMs - lastTunPacketAtMs else -1L
+        Log.d(
+            TAG,
+            "TUN stats source=$source intervalMs=$elapsedMs tunPkts=$tunPkts " +
+                "tunReadable=$tunReadable read0=$readZero lastTunAgoMs=$lastTunAgoMs"
+        )
+        lastTunStatsReportAtMs = nowMs
+    }
+
+    private fun updateState(
+        newState: String,
+        reason: String,
+        detail: String? = null,
+        nowMs: Long = System.currentTimeMillis()
+    ) {
+        if (currentState == newState) return
+        val previous = currentState
+        currentState = newState
+        lastStateChangeAtMs = nowMs
+        if (!DEBUG_LOGS) return
+        val detailSuffix = if (detail.isNullOrBlank()) "" else " $detail"
+        Log.i(TAG, "STATE $previous -> $newState reason=$reason$detailSuffix")
+    }
+
+    private fun requestNetworkReset(reason: String, forceImmediate: Boolean = false) {
+        if (!isRunning || stopSignal.get()) return
+        lastResetReason = reason
+        val seq = resetSequence.incrementAndGet()
+        if (DEBUG_LOGS) {
+            Log.i(TAG, "RESET request seq=$seq reason=$reason force=$forceImmediate")
+        }
+        scheduleNetworkReset(forceImmediate)
+    }
+
+    private fun scheduleNetworkResetDelayed(reason: String, delayMs: Long) {
+        if (!isRunning || stopSignal.get()) return
+        lastResetReason = reason
+        if (DEBUG_LOGS) {
+            Log.i(TAG, "RESET scheduled reason=$reason delayMs=$delayMs")
+        }
+        updateState(STATE_WAIT_RETRY, "reset_scheduled", "delayMs=$delayMs")
+        if (!resetRetryScheduled.compareAndSet(false, true)) return
+        val scheduler = getResetScheduler()
+        scheduler.schedule(
+            {
+                resetRetryScheduled.set(false)
+                scheduleNetworkReset(forceImmediate = true)
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun logDiagnosticSnapshot(trigger: String) {
+        if (!DEBUG_LOGS) return
+        val nowMs = System.currentTimeMillis()
+        val manager = connectivityManager
+        val network = currentNetwork
+        val caps = if (network != null) manager?.getNetworkCapabilities(network) else null
+        val linkProps = if (network != null) manager?.getLinkProperties(network) else null
+        val transports = caps?.let { describeTransports(it) } ?: "unknown"
+        val validated = caps?.let { isValidatedCapability(it) }
+        val dnsServers = formatDnsServers(linkProps)
+        val tunLastAgoMs = if (lastTunPacketAtMs > 0) nowMs - lastTunPacketAtMs else -1L
+        val upstreamOkAgoMs = run {
+            val lastOk = lastUpstreamSuccessAtMs.get()
+            if (lastOk > 0) nowMs - lastOk else -1L
+        }
+        val upstreamFailAgoMs = run {
+            val lastFail = lastUpstreamFailureAtMs.get()
+            if (lastFail > 0) nowMs - lastFail else -1L
+        }
+        val resetAgoMs = if (lastResetAtMs > 0) nowMs - lastResetAtMs else -1L
+        val requestQueueSize = requestQueue?.size ?: -1
+        val responseQueueSize = responseQueue?.size ?: -1
+        Log.i(
+            TAG,
+            "DIAG trigger=$trigger state=$currentState netId=$network transports=$transports " +
+                "validated=$validated dns=$dnsServers tunLastAgoMs=$tunLastAgoMs " +
+                "upstreamOkAgoMs=$upstreamOkAgoMs upstreamFailAgoMs=$upstreamFailAgoMs " +
+                "upstreamConsecutiveFailures=${upstreamConsecutiveFailures.get()} resets=${resetCount.get()} " +
+                "lastResetReason=$lastResetReason lastResetAgoMs=$resetAgoMs backoffMs=${resetBackoffMs.get()} " +
+                "queues=request=$requestQueueSize/response=$responseQueueSize idle=$isIdleMode " +
+                "screenInteractive=$screenInteractive"
+        )
+    }
+
+    private fun logNetworkEvent(
+        manager: ConnectivityManager,
+        event: String,
+        network: Network,
+        caps: NetworkCapabilities? = null,
+        wasValidated: Boolean? = null
+    ) {
+        if (!DEBUG_LOGS) return
+        val resolvedCaps = caps ?: manager.getNetworkCapabilities(network)
+        val transports = resolvedCaps?.let { describeTransports(it) } ?: "unknown"
+        val validated = resolvedCaps?.let { isValidatedCapability(it) }
+        val hasInternet = resolvedCaps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        val notMetered = resolvedCaps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        val captivePortal = resolvedCaps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+        val dnsServers = formatDnsServers(manager.getLinkProperties(network))
+        val wasValidatedText = wasValidated?.toString() ?: "unknown"
+        Log.i(
+            TAG,
+            "NET $event netId=$network transports=$transports validated=$validated " +
+                "wasValidated=$wasValidatedText internet=$hasInternet notMetered=$notMetered " +
+                "captivePortal=$captivePortal dns=$dnsServers"
+        )
+    }
+
+    private fun describeTransports(caps: NetworkCapabilities): String {
+        val transports = ArrayList<String>(4)
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) transports.add("CELL")
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) transports.add("WIFI")
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) transports.add("ETH")
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) transports.add("VPN")
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_BLUETOOTH)) transports.add("BT")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI_AWARE)) transports.add("WIFI_AWARE")
+        }
+        return if (transports.isEmpty()) "none" else transports.joinToString(",")
+    }
+
+    private fun formatDnsServers(linkProps: android.net.LinkProperties?): String {
+        val servers = linkProps?.dnsServers ?: return "unknown"
+        if (servers.isEmpty()) return "none"
+        return servers.joinToString(",")
+    }
+
     private fun isScreenInteractive(powerManager: PowerManager): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT_WATCH) {
             powerManager.isInteractive
@@ -830,32 +1035,26 @@ class DnsVpnService : VpnService() {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 lastNetworkAvailableAtMs = System.currentTimeMillis()
+                logNetworkEvent(manager, "available", network)
                 updateCurrentNetwork("available")
             }
 
             override fun onLost(network: Network) {
                 lastNetworkLostAtMs = System.currentTimeMillis()
                 networkValidated.remove(network)
+                logNetworkEvent(manager, "lost", network)
                 updateCurrentNetwork("lost")
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 val validated = isValidatedCapability(networkCapabilities)
-                if (DEBUG_LOGS) {
-                    val hasInternet = networkCapabilities.hasCapability(
-                        NetworkCapabilities.NET_CAPABILITY_INTERNET
-                    )
-                    Log.i(
-                        TAG,
-                        "caps changed network=$network validated=$validated internet=$hasInternet"
-                    )
-                }
                 val wasValidated = networkValidated.put(network, validated)
+                logNetworkEvent(manager, "capChanged", network, networkCapabilities, wasValidated)
                 updateCurrentNetwork("capabilities")
                 if (network == currentNetwork) {
                     if (wasValidated == false && validated) {
                         Log.i(TAG, "Network validated again; forcing VPN reset network=$network")
-                        scheduleNetworkReset(forceImmediate = true)
+                        requestNetworkReset("validated_recovered", forceImmediate = true)
                     }
                 }
             }
@@ -897,7 +1096,7 @@ class DnsVpnService : VpnService() {
         if (DEBUG_LOGS) {
             Log.d(TAG, "Upstream network updated reason=$reason selected=$selected")
         }
-        scheduleNetworkReset()
+        requestNetworkReset("network_$reason")
     }
 
     private fun selectUpstreamNetwork(manager: ConnectivityManager): Network? {
@@ -971,20 +1170,6 @@ class DnsVpnService : VpnService() {
         )
     }
 
-    private fun scheduleNetworkResetDelayed(delayMs: Long) {
-        if (!isRunning || stopSignal.get()) return
-        if (!resetRetryScheduled.compareAndSet(false, true)) return
-        val scheduler = getResetScheduler()
-        scheduler.schedule(
-            {
-                resetRetryScheduled.set(false)
-                scheduleNetworkReset(forceImmediate = true)
-            },
-            delayMs,
-            TimeUnit.MILLISECONDS
-        )
-    }
-
     private fun computeResetBackoffMs(): Long {
         val previous = resetBackoffMs.get()
         val next = if (previous <= 0) {
@@ -998,6 +1183,10 @@ class DnsVpnService : VpnService() {
 
     private fun runNetworkReset() {
         if (!resetInFlight.compareAndSet(false, true)) return
+        val nowMs = System.currentTimeMillis()
+        lastResetAtMs = nowMs
+        resetCount.incrementAndGet()
+        updateState(STATE_RESETTING, "reset_run", "reason=$lastResetReason", nowMs)
         try {
             while (resetPending.getAndSet(false)) {
                 handleNetworkChange()
@@ -1039,8 +1228,9 @@ class DnsVpnService : VpnService() {
         val lastResetMs = lastTunStallResetAtMs
         if (lastResetMs > 0 && nowMs - lastResetMs < TUN_STALL_RESET_COOLDOWN_MS) return
         lastTunStallResetAtMs = nowMs
+        updateState(STATE_TUN_SILENT, "tun_silent", "lastTunAgoMs=$idleMs", nowMs)
         Log.w(TAG, "No TUN traffic for ${idleMs}ms; forcing VPN reset")
-        scheduleNetworkReset(forceImmediate = true)
+        requestNetworkReset("tun_silent", forceImmediate = true)
     }
 
     private fun hasUpstreamNetwork(): Boolean {
@@ -1079,7 +1269,7 @@ class DnsVpnService : VpnService() {
             if (sockets.isEmpty()) {
                 val delayMs = computeResetBackoffMs()
                 Log.w(TAG, "Upstream socket creation failed; retrying in ${delayMs}ms")
-                scheduleNetworkResetDelayed(delayMs)
+                scheduleNetworkResetDelayed("upstream_socket_failed", delayMs)
                 return
             }
             resetBackoffMs.set(0)
@@ -1090,17 +1280,20 @@ class DnsVpnService : VpnService() {
             shutdownUpstreamLocked()
             upstreamSockets = sockets
             startUpstreamWorkers(sockets, currentRequestQueue, currentResponseQueue, currentProcessor, metrics)
+            updateState(STATE_RUNNING_OK, "reset_complete")
         }
     }
 
     private fun createUpstreamSockets(network: Network?): List<DatagramSocket> {
         val sockets = mutableListOf<DatagramSocket>()
-        repeat(UPSTREAM_WORKER_COUNT) {
+        val attempt = upstreamCreateAttempt.incrementAndGet()
+        var bindFailures = 0
+        repeat(UPSTREAM_WORKER_COUNT) { index ->
             val socket = DatagramSocket().apply {
                 soTimeout = UPSTREAM_TIMEOUT_MS
             }
             if (!protect(socket)) {
-                Log.w(TAG, "Failed to protect upstream socket; network=$network")
+                Log.w(TAG, "UP attempt=$attempt idx=$index protect=fail netId=$network")
                 socket.close()
                 sockets.forEach { it.close() }
                 return emptyList()
@@ -1109,18 +1302,22 @@ class DnsVpnService : VpnService() {
                 try {
                     network.bindSocket(socket)
                     if (DEBUG_LOGS) {
-                        Log.d(TAG, "Bound upstream socket to network=$network")
+                        Log.d(TAG, "UP attempt=$attempt idx=$index bind=ok netId=$network")
                     }
                 } catch (error: Exception) {
-                    Log.w(TAG, "Failed to bind upstream socket to network: ${error.message}")
+                    bindFailures += 1
+                    Log.w(TAG, "UP attempt=$attempt idx=$index bind=fail netId=$network error=${error.message}")
                 }
             } else if (DEBUG_LOGS) {
-                Log.d(TAG, "Upstream socket created without network binding")
+                Log.d(TAG, "UP attempt=$attempt idx=$index bind=skip netId=null")
             }
             sockets.add(socket)
         }
         if (DEBUG_LOGS) {
-            Log.d(TAG, "Upstream sockets created count=${sockets.size} network=$network")
+            Log.d(
+                TAG,
+                "UP attempt=$attempt netId=$network sockets=${sockets.size} bindFailures=$bindFailures"
+            )
         }
         return sockets
     }
@@ -1277,6 +1474,7 @@ class DnsVpnService : VpnService() {
         const val ACTION_START = "com.example.android_adblocker.action.START"
         const val ACTION_STOP = "com.example.android_adblocker.action.STOP"
         const val ACTION_RELOAD_RULES = "com.example.android_adblocker.action.RELOAD_RULES"
+        const val ACTION_DIAG = "com.example.android_adblocker.action.DIAG"
         const val NOTIFICATION_CHANNEL_ID = "adblocker_vpn"
         const val NOTIFICATION_ID = 1001
 
@@ -1320,7 +1518,15 @@ class DnsVpnService : VpnService() {
         // NOTE: Set false to fall back to the legacy FileInputStream read loop.
         private const val USE_POLL_LOOP = true
         private const val POLL_TIMEOUT_MS = 1000
+        private const val TUN_STATS_REPORT_INTERVAL_MS = 10_000L
         private val DEBUG_LOGS = BuildConfig.DEBUG
+
+        private const val STATE_STOPPED = "STOPPED"
+        private const val STATE_RUNNING_OK = "RUNNING_OK"
+        private const val STATE_TUN_SILENT = "TUN_SILENT"
+        private const val STATE_UPSTREAM_DOWN = "UPSTREAM_DOWN"
+        private const val STATE_RESETTING = "RESETTING"
+        private const val STATE_WAIT_RETRY = "WAIT_RETRY"
 
         @Volatile
         var isRunning: Boolean = false
@@ -1383,6 +1589,27 @@ class DnsVpnService : VpnService() {
     private var lastTunStallResetAtMs: Long = 0
     @Volatile
     private var lastUpstreamSendAtMs: Long = 0
+    @Volatile
+    private var lastTunPacketAtMs: Long = 0
+    @Volatile
+    private var lastTunStatsReportAtMs: Long = 0
+    private val tunPacketsInWindow = AtomicLong(0)
+    private val tunReadableCount = AtomicLong(0)
+    private val tunReadZeroCount = AtomicLong(0)
+    private val upstreamConsecutiveFailures = AtomicInteger(0)
+    private val lastUpstreamSuccessAtMs = AtomicLong(0)
+    private val lastUpstreamFailureAtMs = AtomicLong(0)
+    private val resetSequence = AtomicInteger(0)
+    private val resetCount = AtomicInteger(0)
+    @Volatile
+    private var lastResetReason: String = STATE_STOPPED
+    @Volatile
+    private var lastResetAtMs: Long = 0
+    @Volatile
+    private var currentState: String = STATE_STOPPED
+    @Volatile
+    private var lastStateChangeAtMs: Long = 0
+    private val upstreamCreateAttempt = AtomicInteger(0)
     private val resetPending = AtomicBoolean(false)
     private val resetInFlight = AtomicBoolean(false)
     private val resetRetryScheduled = AtomicBoolean(false)

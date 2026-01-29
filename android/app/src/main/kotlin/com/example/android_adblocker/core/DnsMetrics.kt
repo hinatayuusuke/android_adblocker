@@ -14,6 +14,10 @@ internal class DnsMetrics(
     private val upstreamSends = AtomicLong(0)
     private val upstreamSuccesses = AtomicLong(0)
     private val upstreamFailures = AtomicLong(0)
+    private val upstreamConsecutiveFailures = AtomicLong(0)
+    private val lastUpstreamSuccessAtMs = AtomicLong(0)
+    private val lastUpstreamFailureAtMs = AtomicLong(0)
+    private val lastUpstreamRttMs = AtomicLong(0)
 
     private val reportLock = Any()
     private var lastReportAtMs: Long = 0
@@ -36,14 +40,19 @@ internal class DnsMetrics(
         upstreamSends.incrementAndGet()
     }
 
-    fun onUpstreamSuccess() {
+    fun onUpstreamSuccess(elapsedMs: Long, nowMs: Long = System.currentTimeMillis()) {
         if (!enabled) return
         upstreamSuccesses.incrementAndGet()
+        upstreamConsecutiveFailures.set(0)
+        lastUpstreamSuccessAtMs.set(nowMs)
+        lastUpstreamRttMs.set(elapsedMs)
     }
 
-    fun onUpstreamFailure() {
+    fun onUpstreamFailure(nowMs: Long = System.currentTimeMillis()) {
         if (!enabled) return
         upstreamFailures.incrementAndGet()
+        upstreamConsecutiveFailures.incrementAndGet()
+        lastUpstreamFailureAtMs.set(nowMs)
     }
 
     fun maybeReport(reason: String, nowMs: Long) {
@@ -63,6 +72,12 @@ internal class DnsMetrics(
             val upstreamSend = upstreamSends.getAndSet(0)
             val upstreamSuccess = upstreamSuccesses.getAndSet(0)
             val upstreamFailure = upstreamFailures.getAndSet(0)
+            val consecutiveFailures = upstreamConsecutiveFailures.get()
+            val lastSuccessAtMs = lastUpstreamSuccessAtMs.get()
+            val lastFailureAtMs = lastUpstreamFailureAtMs.get()
+            val lastRttMs = lastUpstreamRttMs.get()
+            val lastSuccessAgoMs = if (lastSuccessAtMs > 0) nowMs - lastSuccessAtMs else -1L
+            val lastFailureAgoMs = if (lastFailureAtMs > 0) nowMs - lastFailureAtMs else -1L
 
             val gcDelta = readGcDelta()
             // NOTE: Use -1 when runtime stats are unavailable to keep log parsing stable.
@@ -74,7 +89,9 @@ internal class DnsMetrics(
                 "metrics reason=$reason intervalMs=$elapsedMs " +
                     "watchdogWakeups=$wakeups watchdogQueueEmpty=$queueEmpty " +
                     "upstreamSend=$upstreamSend upstreamSuccess=$upstreamSuccess " +
-                    "upstreamFailure=$upstreamFailure gcCountDelta=$gcCountDelta gcTimeDeltaMs=$gcTimeDelta"
+                    "upstreamFailure=$upstreamFailure upstreamConsecutiveFailures=$consecutiveFailures " +
+                    "lastUpstreamSuccessAgoMs=$lastSuccessAgoMs lastUpstreamFailureAgoMs=$lastFailureAgoMs " +
+                    "lastUpstreamRttMs=$lastRttMs gcCountDelta=$gcCountDelta gcTimeDeltaMs=$gcTimeDelta"
             )
         }
     }
