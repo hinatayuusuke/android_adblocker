@@ -58,7 +58,11 @@ internal class DnsPacketProcessor(
     }
 
     fun buildUdpResponse(packetInfo: PacketInfo, dnsPayload: ByteArray): ByteArray {
-        val udpLength = UDP_HEADER_LEN + dnsPayload.size
+        return buildUdpResponse(packetInfo, dnsPayload, dnsPayload.size)
+    }
+
+    fun buildUdpResponse(packetInfo: PacketInfo, dnsPayload: ByteArray, dnsLength: Int): ByteArray {
+        val udpLength = UDP_HEADER_LEN + dnsLength
         val totalLength = IPV4_HEADER_MIN_LEN + udpLength
         val buffer = ByteArray(totalLength)
 
@@ -80,13 +84,17 @@ internal class DnsPacketProcessor(
         writeU16(buffer, IPV4_HEADER_MIN_LEN + 4, udpLength)
         // WHY: IPv4のUDPチェックサムは省略可能で、フィルタ専用の負荷を抑えるため0にする。
         writeU16(buffer, IPV4_HEADER_MIN_LEN + 6, 0)
-        System.arraycopy(dnsPayload, 0, buffer, IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN, dnsPayload.size)
+        System.arraycopy(dnsPayload, 0, buffer, IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN, dnsLength)
 
         return buffer
     }
 
     fun buildServfailResponse(query: DnsQuery): ByteArray {
         return buildErrorResponse(query, DNS_RCODE_SERVFAIL)
+    }
+
+    fun cacheKey(query: DnsQuery): String {
+        return "${query.domain}|${query.qtype}|${query.qclass}"
     }
 
     private fun parseQuery(packet: ByteArray, offset: Int, length: Int): DnsQuery? {
@@ -119,12 +127,16 @@ internal class DnsPacketProcessor(
         val questionEnd = index + 4
         val question = packet.copyOfRange(offset + DNS_HEADER_LEN, questionEnd)
         if (question.isEmpty()) return null
+        val qtype = readU16(question, question.size - 4)
+        val qclass = readU16(question, question.size - 2)
 
         return DnsQuery(
             id = id,
             flags = flags,
             question = question,
-            domain = domainBuilder.toString()
+            domain = domainBuilder.toString(),
+            qtype = qtype,
+            qclass = qclass
         )
     }
 
@@ -234,7 +246,9 @@ internal class DnsPacketProcessor(
         val id: Int,
         val flags: Int,
         val question: ByteArray,
-        val domain: String
+        val domain: String,
+        val qtype: Int,
+        val qclass: Int
     )
 
     private companion object {
