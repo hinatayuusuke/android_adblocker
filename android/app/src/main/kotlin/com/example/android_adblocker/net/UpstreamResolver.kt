@@ -39,7 +39,10 @@ internal class UpstreamResolver(
             metrics.onUpstreamSuccess()
             responseView.length = responsePacket.length
             responseView
-        } catch (_: IOException) {
+        } catch (e: IOException) {
+            if (DEBUG_LOGS) {
+                Log.w(TAG, "Upstream resolution failed: ${e.javaClass.simpleName} - ${e.message}")
+            }
             metrics.onUpstreamFailure()
             null
         }
