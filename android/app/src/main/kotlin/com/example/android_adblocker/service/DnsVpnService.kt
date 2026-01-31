@@ -559,11 +559,18 @@ class DnsVpnService : VpnService() {
         var fallback: Network? = null
         for (network in networks) {
             val caps = manager.getNetworkCapabilities(network) ?: continue
+            val isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            val isWifiOrCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || 
+                                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+
+            // 純粋なVPN（Wi-Fi/Cellular属性を持たないもの）のみを除外する
+            if (isVpn && !isWifiOrCellular) {
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
                 if (DEBUG_LOGS) {
                     Log.d(TAG, "Skip VPN network=$network")
                 }
                 continue
+            }
             }
             if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
             val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
