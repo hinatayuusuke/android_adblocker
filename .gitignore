@@ -47,4 +47,4 @@ app.*.map.json
 #doc 
 doc/
 .agent/
-agents.md
+.serena/

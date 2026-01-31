@@ -2,12 +2,17 @@ package com.example.android_adblocker.data
 
 import android.content.Context
 import android.util.Log
+import com.example.android_adblocker.BuildConfig
 import java.io.IOException
 
 internal object BlocklistLoader {
     private const val TAG = "BlocklistLoader"
 
     fun load(context: Context, assetName: String): Set<String> {
+        val startMs = System.currentTimeMillis()
+        if (BuildConfig.DEBUG) {
+            Log.d(TAG, "blocklist load start asset=$assetName")
+        }
         val set = mutableSetOf<String>()
         try {
             context.assets.open(assetName).bufferedReader().useLines { lines ->
@@ -28,6 +33,10 @@ internal object BlocklistLoader {
             }
         } catch (error: IOException) {
             Log.w(TAG, "ブロックリスト読み込み失敗: ${error.message}")
+        }
+        if (BuildConfig.DEBUG) {
+            val elapsedMs = System.currentTimeMillis() - startMs
+            Log.d(TAG, "blocklist load done asset=$assetName entries=${set.size} elapsedMs=$elapsedMs")
         }
         return set
     }
