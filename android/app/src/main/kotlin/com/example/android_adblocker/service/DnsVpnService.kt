@@ -851,29 +851,27 @@ class DnsVpnService : VpnService() {
         val networks = manager.allNetworks
         if (networks.isEmpty()) return UpstreamSelection(null, false)
         var fallback: Network? = null
+        var fallbackScore = Int.MIN_VALUE
         for (network in networks) {
             val caps = manager.getNetworkCapabilities(network) ?: continue
-            val isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-            val isWifiOrCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || 
-                                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-
-            // 純粋なVPN（Wi-Fi/Cellular属性を持たないもの）のみを除外する
-            if (isVpn && !isWifiOrCellular) {
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-                if (DEBUG_LOGS) {
-                    Log.d(TAG, "Skip VPN network=$network")
-                }
-                continue
-            }
-            }
             if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            // WHY: VPNネットワークは下位回線のTRANSPORTが併記される端末があるため、
+            //      transport判定ではなく NOT_VPN capability で候補を絞る。
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
             val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
                 caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
             if (validated) {
                 return UpstreamSelection(network, true)
             }
-            if (fallback == null) {
+            val score = when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 30
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 20
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> 10
+                else -> 0
+            }
+            if (fallback == null || score > fallbackScore) {
                 fallback = network
+                fallbackScore = score
             }
         }
         return UpstreamSelection(fallback, false)
@@ -937,6 +935,16 @@ class DnsVpnService : VpnService() {
 
     private fun createUpstreamSockets(network: Network?): List<DatagramSocket> {
         val sockets = mutableListOf<DatagramSocket>()
+        val manager = connectivityManager
+        val shouldBindToNetwork = network != null && manager != null && isSafeUpstreamNetwork(manager, network)
+        if (network != null && !shouldBindToNetwork) {
+            // SECURITY/COMPAT: 誤ってVPNネットワークにbindすると自己VPNループで通信断になり得るため、
+            //                  capabilitiesが確認できない/NOT_VPNでない場合はbindしない。
+            Log.w(TAG, "Skip binding upstream sockets to unsafe network=$network")
+            if (DEBUG_LOGS && manager != null) {
+                Log.d(TAG, "Unsafe upstream network detail: ${describeUpstreamNetwork(manager, network)}")
+            }
+        }
         repeat(UPSTREAM_WORKER_COUNT) {
             val socket = DatagramSocket().apply {
                 soTimeout = UPSTREAM_TIMEOUT_MS
@@ -946,9 +954,9 @@ class DnsVpnService : VpnService() {
                 sockets.forEach { it.close() }
                 return emptyList()
             }
-            if (network != null) {
+            if (shouldBindToNetwork) {
                 try {
-                    network.bindSocket(socket)
+                    network!!.bindSocket(socket)
                     if (DEBUG_LOGS) {
                         Log.d(TAG, "Bound upstream socket to network=$network")
                     }
@@ -964,6 +972,35 @@ class DnsVpnService : VpnService() {
             Log.d(TAG, "Upstream sockets created count=${sockets.size} network=$network")
         }
         return sockets
+    }
+
+    private fun isSafeUpstreamNetwork(manager: ConnectivityManager, network: Network): Boolean {
+        val caps = manager.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun describeUpstreamNetwork(manager: ConnectivityManager, network: Network): String {
+        val caps = manager.getNetworkCapabilities(network)
+        val linkProperties = manager.getLinkProperties(network)
+        val transports = if (caps == null) {
+            "unknown"
+        } else {
+            val items = mutableListOf<String>()
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) items.add("WIFI")
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) items.add("CELLULAR")
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) items.add("ETHERNET")
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) items.add("VPN")
+            items.joinToString(separator = ",").ifEmpty { "none" }
+        }
+        val internet = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false
+        val notVpn = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) ?: false
+        val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+            (caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false)
+        val captivePortal = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL) ?: false
+
+        return "network=$network iface=${linkProperties?.interfaceName} transports=$transports " +
+            "internet=$internet notVpn=$notVpn validated=$validated captivePortal=$captivePortal"
     }
 
     private fun shutdownUpstreamLocked() {
