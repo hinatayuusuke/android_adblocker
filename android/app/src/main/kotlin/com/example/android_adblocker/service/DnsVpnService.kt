@@ -146,6 +146,11 @@ class DnsVpnService : VpnService() {
         lastPacketAtMs = 0
         lastResponseWriteAtMs = 0
         pendingNetworkReset = false
+        lastUpstreamSuccessAtMs = 0
+        lastUpstreamResetAtMs = 0
+        upstreamWindowStartMs = 0
+        upstreamWindowTotal.set(0)
+        upstreamWindowFailures.set(0)
         val metrics = DnsMetrics(DEBUG_LOGS)
         this.metrics = metrics
         dnsCache = DnsCache(DNS_CACHE_MAX_ENTRIES, DNS_CACHE_TTL_MS)
@@ -191,6 +196,11 @@ class DnsVpnService : VpnService() {
         wakeupPipe?.wake()
         lastPacketAtMs = 0
         pendingNetworkReset = false
+        lastUpstreamSuccessAtMs = 0
+        lastUpstreamResetAtMs = 0
+        upstreamWindowStartMs = 0
+        upstreamWindowTotal.set(0)
+        upstreamWindowFailures.set(0)
         stopNetworkMonitor()
         stopScreenMonitor()
         val worker = workerThread
@@ -621,6 +631,8 @@ class DnsVpnService : VpnService() {
                         }
                     }
                     val resolvedPayload = resolver.resolve(job.queryPayload)
+                    val finishMs = System.currentTimeMillis()
+                    recordUpstreamResult(resolvedPayload != null, finishMs)
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1
                         if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
@@ -645,6 +657,54 @@ class DnsVpnService : VpnService() {
                 name = "upstreamWorker#$index"
                 start()
             }
+        }
+    }
+
+    private fun recordUpstreamResult(success: Boolean, nowMs: Long) {
+        if (!isRunning || stopSignal.get()) return
+        var shouldReset = false
+        var failRate = 0.0
+        var total = 0
+        var failures = 0
+        var noSuccessMs = 0L
+        synchronized(upstreamStatsLock) {
+            if (upstreamWindowStartMs == 0L ||
+                nowMs - upstreamWindowStartMs >= UPSTREAM_WINDOW_MS
+            ) {
+                upstreamWindowStartMs = nowMs
+                upstreamWindowTotal.set(0)
+                upstreamWindowFailures.set(0)
+            }
+            upstreamWindowTotal.incrementAndGet()
+            if (success) {
+                lastUpstreamSuccessAtMs = nowMs
+            } else {
+                upstreamWindowFailures.incrementAndGet()
+            }
+            val lastOkMs = lastUpstreamSuccessAtMs
+            noSuccessMs = if (lastOkMs > 0) nowMs - lastOkMs else Long.MAX_VALUE
+            total = upstreamWindowTotal.get()
+            failures = upstreamWindowFailures.get()
+            if (total >= UPSTREAM_WINDOW_MIN_SAMPLES) {
+                failRate = failures.toDouble() / total.toDouble()
+                val cooldownMs = nowMs - lastUpstreamResetAtMs
+                if (noSuccessMs >= UPSTREAM_NO_SUCCESS_MS &&
+                    failRate >= UPSTREAM_FAIL_RATE_THRESHOLD &&
+                    (lastUpstreamResetAtMs == 0L || cooldownMs >= UPSTREAM_RESET_COOLDOWN_MS)
+                ) {
+                    lastUpstreamResetAtMs = nowMs
+                    shouldReset = true
+                }
+            }
+        }
+        if (shouldReset) {
+            // WHY: Network callbacks may not fire on short outages; use rate+time to recover safely.
+            Log.w(
+                TAG,
+                "Upstream reset by rate/time total=$total failures=$failures " +
+                    "failRate=${"%.2f".format(failRate)} noSuccessMs=$noSuccessMs"
+            )
+            scheduleNetworkReset()
         }
     }
 
@@ -1167,6 +1227,12 @@ class DnsVpnService : VpnService() {
         private const val UPSTREAM_TIMEOUT_MS = 2000
         private const val UPSTREAM_WORKER_COUNT = 4
         private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 20
+        // WHY: Avoid reset flapping by requiring a window with high failure rate and no recent success.
+        private const val UPSTREAM_WINDOW_MS = 15_000L
+        private const val UPSTREAM_WINDOW_MIN_SAMPLES = 4
+        private const val UPSTREAM_NO_SUCCESS_MS = 6_000L
+        private const val UPSTREAM_FAIL_RATE_THRESHOLD = 0.6
+        private const val UPSTREAM_RESET_COOLDOWN_MS = 30_000L
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
@@ -1251,6 +1317,12 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var lastResponseEnqueueAtMs: Long = 0
     @Volatile
+    private var lastUpstreamSuccessAtMs: Long = 0
+    @Volatile
+    private var lastUpstreamResetAtMs: Long = 0
+    @Volatile
+    private var upstreamWindowStartMs: Long = 0
+    @Volatile
     private var pendingNetworkReset: Boolean = false
     @Volatile
     private var fatalStopRequested: Boolean = false
@@ -1258,6 +1330,9 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var responseWatchdogLongWait: Boolean = false
     private val upstreamResetLock = Any()
+    private val upstreamStatsLock = Any()
+    private val upstreamWindowTotal = AtomicInteger(0)
+    private val upstreamWindowFailures = AtomicInteger(0)
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
     private val responseWriterStallCount = AtomicInteger(0)
