@@ -630,9 +630,11 @@ class DnsVpnService : VpnService() {
                             break
                         }
                     }
+                    val startNs = System.nanoTime()
                     val resolvedPayload = resolver.resolve(job.queryPayload)
                     val finishMs = System.currentTimeMillis()
-                    recordUpstreamResult(resolvedPayload != null, finishMs)
+                    val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
+                    recordUpstreamResult(resolvedPayload != null, finishMs, elapsedMs)
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1
                         if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
@@ -660,7 +662,7 @@ class DnsVpnService : VpnService() {
         }
     }
 
-    private fun recordUpstreamResult(success: Boolean, nowMs: Long) {
+    private fun recordUpstreamResult(success: Boolean, nowMs: Long, elapsedMs: Long) {
         if (!isRunning || stopSignal.get()) return
         var shouldReset = false
         var failRate = 0.0
@@ -676,9 +678,11 @@ class DnsVpnService : VpnService() {
                 upstreamWindowFailures.set(0)
             }
             upstreamWindowTotal.incrementAndGet()
-            if (success) {
+            // WHY: Extremely fast "success" can be a local error/loop; do not refresh last success time.
+            val isValidSuccess = success && elapsedMs >= UPSTREAM_MIN_VALID_SUCCESS_MS
+            if (isValidSuccess) {
                 lastUpstreamSuccessAtMs = nowMs
-            } else {
+            } else if (!success) {
                 upstreamWindowFailures.incrementAndGet()
             }
             val lastOkMs = lastUpstreamSuccessAtMs
@@ -1232,7 +1236,8 @@ class DnsVpnService : VpnService() {
         private const val UPSTREAM_WINDOW_MIN_SAMPLES = 4
         private const val UPSTREAM_NO_SUCCESS_MS = 6_000L
         private const val UPSTREAM_FAIL_RATE_THRESHOLD = 0.6
-        private const val UPSTREAM_RESET_COOLDOWN_MS = 30_000L
+        private const val UPSTREAM_RESET_COOLDOWN_MS = 15_000L
+        private const val UPSTREAM_MIN_VALID_SUCCESS_MS = 5L
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
