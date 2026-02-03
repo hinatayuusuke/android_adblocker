@@ -878,10 +878,24 @@ class DnsVpnService : VpnService() {
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                 if (DEBUG_LOGS) {
-                    val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-                        networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                     Log.d(TAG, "NET_MON_NONVPN cap net=$network validated=$validated")
+                }
+                if (network == currentNetwork) {
+                    val prev = currentValidated
+                    if (prev == null || prev != validated) {
+                        currentValidated = validated
+                        if (DEBUG_LOGS) {
+                            Log.d(
+                                TAG,
+                                "NET_RESET_TRIGGER source=nonvpn_cap validatedFlip prev=$prev now=$validated"
+                            )
+                        }
+                        scheduleNetworkReset()
+                    }
+                    return
                 }
                 updateCurrentNetwork("nonvpn_caps")
             }
@@ -893,6 +907,10 @@ class DnsVpnService : VpnService() {
                         "NET_MON_NONVPN link net=$network dns=${linkProperties.dnsServers} " +
                             "routes=${linkProperties.routes.size}"
                     )
+                }
+                if (network == currentNetwork) {
+                    scheduleNetworkReset()
+                    return
                 }
                 updateCurrentNetwork("nonvpn_link")
             }
