@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -367,12 +368,16 @@ class DnsVpnService : VpnService() {
         fun reportIfNeeded(nowMs: Long) {
             if (!DEBUG_LOGS) return
             if (nowMs - lastPollReportAtMs < ZERO_READ_REPORT_INTERVAL_MS) return
+            val lastPacketDeltaMs = if (lastPacketAtMs > 0) nowMs - lastPacketAtMs else -1
+            val lastWriteDeltaMs = if (lastResponseWriteAtMs > 0) nowMs - lastResponseWriteAtMs else -1
             Log.d(
                 TAG,
                 "packetLoop pollStats timeouts=$pollTimeouts wakeups=$pollWakeups " +
                     "tunReadable=$pollTunReadable errors=$pollErrors " +
                     "readZeroAfterReadable=$readZeroAfterReadable " +
-                    "intervalMs=${nowMs - lastPollReportAtMs}"
+                    "intervalMs=${nowMs - lastPollReportAtMs} " +
+                    "lastPacketDeltaMs=$lastPacketDeltaMs lastWriteDeltaMs=$lastWriteDeltaMs " +
+                    "pendingReset=$pendingNetworkReset"
             )
             pollTimeouts = 0
             pollWakeups = 0
@@ -453,6 +458,9 @@ class DnsVpnService : VpnService() {
         lastPacketAtMs = System.currentTimeMillis()
         updateIdleModeIfNeeded("packet")
         if (pendingNetworkReset) {
+            if (DEBUG_LOGS) {
+                Log.d(TAG, "NET_RESET_CONSUME pending on packet lastPacketAtMs=$lastPacketAtMs")
+            }
             pendingNetworkReset = false
             handleNetworkChange()
         }
@@ -625,8 +633,10 @@ class DnsVpnService : VpnService() {
                         if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
                             // WHY: Detect stuck upstream and trigger a network reset recovery.
                             consecutiveFailures = 0
-                            Log.w(TAG, "Upstream failures reached $UPSTREAM_FAILURE_RESET_THRESHOLD; scheduling reset")
+                            Log.w(TAG, "UPSTREAM_FAIL_RESET threshold hit -> schedule reset")
                             scheduleNetworkReset()
+                        } else if (DEBUG_LOGS) {
+                            Log.d(TAG, "UPSTREAM_FAIL_COUNT worker=$index count=$consecutiveFailures")
                         }
                     } else {
                         consecutiveFailures = 0
@@ -783,6 +793,7 @@ class DnsVpnService : VpnService() {
     private fun startNetworkMonitor() {
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         currentNetwork = selectUpstreamNetwork(manager)
+        currentValidated = readValidated(manager, currentNetwork)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 lastNetworkAvailableAtMs = System.currentTimeMillis()
@@ -796,6 +807,47 @@ class DnsVpnService : VpnService() {
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 updateCurrentNetwork("capabilities")
+                if (!DEBUG_LOGS) return
+                val internet = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                val notRestricted = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED)
+                val cell = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                val wifi = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                val vpn = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                val eth = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                val prev = currentValidated
+                Log.d(
+                    TAG,
+                    "NET_CAP_CHANGED net=$network current=$currentNetwork same=${network == currentNetwork} " +
+                        "transports=[cell=$cell wifi=$wifi vpn=$vpn eth=$eth] " +
+                        "caps=[internet=$internet validated=$validated notRestricted=$notRestricted] " +
+                        "validatedPrev=$prev"
+                )
+                if (network == currentNetwork && (prev == null || prev != validated)) {
+                    currentValidated = validated
+                    Log.d(
+                        TAG,
+                        "NET_RESET_TRIGGER source=capabilities validatedFlip prev=$prev now=$validated"
+                    )
+                    scheduleNetworkReset()
+                }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (DEBUG_LOGS) {
+                    Log.d(
+                        TAG,
+                        "NET_LINK_CHANGED net=$network current=$currentNetwork same=${network == currentNetwork} " +
+                            "ifname=${linkProperties.interfaceName} dns=${linkProperties.dnsServers} " +
+                            "routes=${linkProperties.routes.size}"
+                    )
+                }
+                if (network == currentNetwork) {
+                    scheduleNetworkReset()
+                } else {
+                    updateCurrentNetwork("linkProperties")
+                }
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -818,6 +870,7 @@ class DnsVpnService : VpnService() {
         connectivityManager = null
         networkCallback = null
         currentNetwork = null
+        currentValidated = null
         lastNetworkAvailableAtMs = 0
         lastNetworkLostAtMs = 0
     }
@@ -825,9 +878,17 @@ class DnsVpnService : VpnService() {
     private fun updateCurrentNetwork(reason: String) {
         val manager = connectivityManager ?: return
         val selected = selectUpstreamNetwork(manager)
+        if (DEBUG_LOGS) {
+            Log.d(
+                TAG,
+                "NET_UPDATE reason=$reason selected=$selected current=$currentNetwork " +
+                    "same=${selected == currentNetwork} validated=$currentValidated"
+            )
+        }
         if (currentNetwork == selected) return
         // WHY: Avoid binding upstream sockets to VPN transport networks.
         currentNetwork = selected
+        currentValidated = readValidated(manager, selected)
         if (DEBUG_LOGS) {
             Log.d(TAG, "Upstream network updated reason=$reason selected=$selected")
         }
@@ -859,12 +920,27 @@ class DnsVpnService : VpnService() {
         return fallback
     }
 
+    private fun readValidated(manager: ConnectivityManager, network: Network?): Boolean? {
+        if (network == null) return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        val caps = manager.getNetworkCapabilities(network) ?: return null
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
     private fun scheduleNetworkReset() {
         if (!isRunning || stopSignal.get()) return
         val lastActiveAtMs = lastPacketAtMs
         val nowMs = System.currentTimeMillis()
         val isActive = lastActiveAtMs > 0 &&
             (nowMs - lastActiveAtMs) <= NETWORK_IDLE_RESET_THRESHOLD_MS
+        if (DEBUG_LOGS) {
+            val delta = if (lastActiveAtMs > 0) nowMs - lastActiveAtMs else -1
+            Log.d(
+                TAG,
+                "NET_RESET_SCHEDULE isActive=$isActive lastPacketDeltaMs=$delta " +
+                    "pending=$pendingNetworkReset"
+            )
+        }
         if (isActive) {
             pendingNetworkReset = false
             handleNetworkChange()
@@ -880,7 +956,11 @@ class DnsVpnService : VpnService() {
         val currentRequestQueue = requestQueue ?: return
         val currentResponseQueue = responseQueue ?: return
         if (DEBUG_LOGS) {
-            Log.d(TAG, "Network change detected. Resetting upstream. currentNetwork=$currentNetwork")
+            Log.d(
+                TAG,
+                "NET_RESET_EXECUTE current=$currentNetwork reqQ=${currentRequestQueue.size} " +
+                    "respQ=${currentResponseQueue.size} sockets=${upstreamSockets.size}"
+            )
         }
         synchronized(upstreamResetLock) {
             if (!isRunning || stopSignal.get()) return
@@ -1154,6 +1234,8 @@ class DnsVpnService : VpnService() {
     private var powerManager: PowerManager? = null
     @Volatile
     private var currentNetwork: Network? = null
+    @Volatile
+    private var currentValidated: Boolean? = null
     @Volatile
     private var isIdleMode: Boolean = false
     @Volatile

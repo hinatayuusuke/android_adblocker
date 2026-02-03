@@ -39,8 +39,20 @@ internal class UpstreamResolver(
             metrics.onUpstreamSuccess()
             responseView.length = responsePacket.length
             responseView
-        } catch (_: IOException) {
+        } catch (error: IOException) {
             metrics.onUpstreamFailure()
+            if (DEBUG_LOGS) {
+                val local = try {
+                    "${socket.localAddress}:${socket.localPort}"
+                } catch (_: Exception) {
+                    "?"
+                }
+                Log.w(
+                    TAG,
+                    "UPSTREAM_FAIL local=$local upstream=$upstream " +
+                        "error=${error.javaClass.simpleName}:${error.message}"
+                )
+            }
             null
         }
     }
