@@ -1,4 +1,4 @@
-package com.example.android_adblocker.service
+﻿package com.example.android_adblocker.service
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -855,20 +855,75 @@ class DnsVpnService : VpnService() {
         } else {
             manager.registerNetworkCallback(NetworkRequest.Builder().build(), callback)
         }
+        val nonVpnRequest = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+            .build()
+        val nonVpnCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                lastNetworkAvailableAtMs = System.currentTimeMillis()
+                if (DEBUG_LOGS) {
+                    Log.d(TAG, "NET_MON_NONVPN available net=$network")
+                }
+                updateCurrentNetwork("nonvpn_available")
+            }
+
+            override fun onLost(network: Network) {
+                lastNetworkLostAtMs = System.currentTimeMillis()
+                if (DEBUG_LOGS) {
+                    Log.d(TAG, "NET_MON_NONVPN lost net=$network")
+                }
+                updateCurrentNetwork("nonvpn_lost")
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                if (DEBUG_LOGS) {
+                    val validated = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                        networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    Log.d(TAG, "NET_MON_NONVPN cap net=$network validated=$validated")
+                }
+                updateCurrentNetwork("nonvpn_caps")
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (DEBUG_LOGS) {
+                    Log.d(
+                        TAG,
+                        "NET_MON_NONVPN link net=$network dns=${linkProperties.dnsServers} " +
+                            "routes=${linkProperties.routes.size}"
+                    )
+                }
+                updateCurrentNetwork("nonvpn_link")
+            }
+        }
+        manager.registerNetworkCallback(nonVpnRequest, nonVpnCallback)
         connectivityManager = manager
         networkCallback = callback
+        this.nonVpnCallback = nonVpnCallback
     }
 
     private fun stopNetworkMonitor() {
         val manager = connectivityManager ?: return
-        val callback = networkCallback ?: return
-        try {
-            manager.unregisterNetworkCallback(callback)
-        } catch (_: IllegalArgumentException) {
-            // WHY: コールバックが登録されていない場合に発生する。
+        val callback = networkCallback
+        val nonVpnCallback = nonVpnCallback
+        if (callback != null) {
+            try {
+                manager.unregisterNetworkCallback(callback)
+            } catch (_: IllegalArgumentException) {
+                // WHY: コールバックが登録されていない場合に発生する。
+            }
+        }
+        if (nonVpnCallback != null) {
+            try {
+                manager.unregisterNetworkCallback(nonVpnCallback)
+            } catch (_: IllegalArgumentException) {
+                // WHY: Receiver may already be unregistered during teardown races.
+            }
         }
         connectivityManager = null
         networkCallback = null
+        this.nonVpnCallback = null
         currentNetwork = null
         currentValidated = null
         lastNetworkAvailableAtMs = 0
@@ -964,7 +1019,7 @@ class DnsVpnService : VpnService() {
         }
         synchronized(upstreamResetLock) {
             if (!isRunning || stopSignal.get()) return
-            // WHY: 旧経路の滞留を残さず復旧後詰まりを減らす。
+            // WHY: コールバックが登録されていない場合に発生する。
             currentResponseQueue.clear()
             // WHY: Stale requests after network switches are likely obsolete; drop to reduce latency.
             currentRequestQueue.clear()
@@ -1231,6 +1286,7 @@ class DnsVpnService : VpnService() {
     private var screenStateReceiver: BroadcastReceiver? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var nonVpnCallback: ConnectivityManager.NetworkCallback? = null
     private var powerManager: PowerManager? = null
     @Volatile
     private var currentNetwork: Network? = null
@@ -1267,3 +1323,4 @@ class DnsVpnService : VpnService() {
     private val responseWriterStallCount = AtomicInteger(0)
     private val stopSignal = AtomicBoolean(false)
 }
+
