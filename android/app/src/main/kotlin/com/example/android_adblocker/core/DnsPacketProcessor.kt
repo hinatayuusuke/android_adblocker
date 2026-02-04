@@ -1,5 +1,7 @@
 package com.example.android_adblocker.core
 
+import android.util.Log
+import com.example.android_adblocker.BuildConfig
 import kotlin.math.min
 
 internal class DnsPacketProcessor(
@@ -49,7 +51,11 @@ internal class DnsPacketProcessor(
             destPort = destPort
         )
         return if (matcher.shouldBlock(normalized)) {
+            if (DEBUG_LOGS) {
+                Log.d(TAG, "DNS_BLOCK domain=$normalized qtype=${query.qtype}")
+            }
             val responsePayload = buildBlockedResponse(query)
+            logDnsResponse(query, responsePayload, responsePayload.size, DNS_RCODE_NXDOMAIN, "block")
             Outcome.Immediate(buildUdpResponse(packetInfo, responsePayload))
         } else {
             val queryPayload = packet.copyOfRange(dnsOffset, dnsOffset + dnsLength)
@@ -157,6 +163,42 @@ internal class DnsPacketProcessor(
         return response
     }
 
+    fun logDnsResponse(
+        query: DnsQuery,
+        payload: ByteArray,
+        length: Int,
+        overrideRcode: Int?,
+        source: String
+    ) {
+        if (!DEBUG_LOGS) return
+        val rcode = overrideRcode ?: parseRcode(payload, length)
+        val rcodeText = rcodeName(rcode)
+        Log.d(
+            TAG,
+            "DNS_RCODE source=$source domain=${query.domain} qtype=${query.qtype} " +
+                "rcode=$rcodeText payloadLen=$length"
+        )
+    }
+
+    private fun parseRcode(payload: ByteArray, length: Int): Int? {
+        if (length < DNS_HEADER_LEN) return null
+        val flags = ((payload[2].toInt() and 0xFF) shl 8) or (payload[3].toInt() and 0xFF)
+        return flags and DNS_RCODE_MASK
+    }
+
+    private fun rcodeName(rcode: Int?): String {
+        return when (rcode) {
+            null -> "unknown"
+            DNS_RCODE_NOERROR -> "NOERROR"
+            DNS_RCODE_FORMERR -> "FORMERR"
+            DNS_RCODE_SERVFAIL -> "SERVFAIL"
+            DNS_RCODE_NXDOMAIN -> "NXDOMAIN"
+            DNS_RCODE_NOTIMP -> "NOTIMP"
+            DNS_RCODE_REFUSED -> "REFUSED"
+            else -> "RCODE_$rcode"
+        }
+    }
+
     private fun readU16(packet: ByteArray, offset: Int): Int {
         return ((packet[offset].toInt() and 0xFF) shl 8) or (packet[offset + 1].toInt() and 0xFF)
     }
@@ -251,7 +293,7 @@ internal class DnsPacketProcessor(
         val qclass: Int
     )
 
-    private companion object {
+    companion object {
         const val IPV4_HEADER_MIN_LEN = 20
         const val IPV4_SRC_ADDR_OFFSET = 12
         const val IPV4_DEST_ADDR_OFFSET = 16
@@ -259,10 +301,17 @@ internal class DnsPacketProcessor(
         const val DNS_HEADER_LEN = 12
         const val DNS_PORT = 53
         const val UDP_PROTOCOL = 17
-        const val DNS_RCODE_NXDOMAIN = 0x0003
+        const val DNS_RCODE_NOERROR = 0x0000
+        const val DNS_RCODE_FORMERR = 0x0001
         const val DNS_RCODE_SERVFAIL = 0x0002
+        const val DNS_RCODE_NXDOMAIN = 0x0003
+        const val DNS_RCODE_NOTIMP = 0x0004
+        const val DNS_RCODE_REFUSED = 0x0005
+        const val DNS_RCODE_MASK = 0x000F
         const val ASCII_UPPER_A = 0x41
         const val ASCII_UPPER_Z = 0x5A
         const val ASCII_CASE_OFFSET = 0x20
+        private const val TAG = "DnsPacketProcessor"
+        private val DEBUG_LOGS = BuildConfig.DEBUG
     }
 }

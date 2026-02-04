@@ -75,6 +75,7 @@ class DnsVpnService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> stopVpn()
             ACTION_RELOAD_RULES -> reloadAllowlist()
+            ACTION_DIAG -> logDiagnosticSnapshot("action_diag")
             else -> startVpn()
         }
         return START_STICKY
@@ -478,6 +479,13 @@ class DnsVpnService : VpnService() {
                 if (!offered) {
                     // WHY: Prefer timely SERVFAIL over long queue backlogs.
                     val responsePayload = processor.buildServfailResponse(outcome.job.query)
+                    processor.logDnsResponse(
+                        outcome.job.query,
+                        responsePayload,
+                        responsePayload.size,
+                        DnsPacketProcessor.DNS_RCODE_SERVFAIL,
+                        "servfail_queue"
+                    )
                     val response = processor.buildUdpResponse(outcome.job.packetInfo, responsePayload)
                     enqueueResponse(responseQueue, response)
                     val count = servfailCount.incrementAndGet()
@@ -613,6 +621,13 @@ class DnsVpnService : VpnService() {
                         if (requestQueue.size >= IDLE_QUEUE_DROP_THRESHOLD) {
                             // WHY: Idle mode favors freshness over backlog on background traffic.
                             val responsePayload = processor.buildServfailResponse(job.query)
+                            processor.logDnsResponse(
+                                job.query,
+                                responsePayload,
+                                responsePayload.size,
+                                DnsPacketProcessor.DNS_RCODE_SERVFAIL,
+                                "servfail_idle"
+                            )
                             val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
                             enqueueResponse(responseQueue, response)
                             if (DEBUG_LOGS) {
@@ -630,6 +645,7 @@ class DnsVpnService : VpnService() {
                     val resolvedPayload = resolver.resolve(job.queryPayload)
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1
+                        recordUpstreamResult(success = false)
                         if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
                             // WHY: Detect stuck upstream and trigger a network reset recovery.
                             consecutiveFailures = 0
@@ -637,15 +653,33 @@ class DnsVpnService : VpnService() {
                             scheduleNetworkReset()
                         } else if (DEBUG_LOGS) {
                             Log.d(TAG, "UPSTREAM_FAIL_COUNT worker=$index count=$consecutiveFailures")
+                            if (consecutiveFailures == DIAG_FAILURE_SNAPSHOT_THRESHOLD) {
+                                logDiagnosticSnapshot("upstream_fail_threshold")
+                            }
                         }
                     } else {
                         consecutiveFailures = 0
+                        recordUpstreamResult(success = true)
                     }
                     val response = if (resolvedPayload == null) {
                         val responsePayload = processor.buildServfailResponse(job.query)
+                        processor.logDnsResponse(
+                            job.query,
+                            responsePayload,
+                            responsePayload.size,
+                            DnsPacketProcessor.DNS_RCODE_SERVFAIL,
+                            "servfail_upstream"
+                        )
                         processor.buildUdpResponse(job.packetInfo, responsePayload)
                     } else {
                         cache?.put(cacheKey, resolvedPayload.buffer.copyOf(resolvedPayload.length), nowMs)
+                        processor.logDnsResponse(
+                            job.query,
+                            resolvedPayload.buffer,
+                            resolvedPayload.length,
+                            null,
+                            "upstream"
+                        )
                         processor.buildUdpResponse(job.packetInfo, resolvedPayload.buffer, resolvedPayload.length)
                     }
                     enqueueResponse(responseQueue, response)
@@ -655,6 +689,48 @@ class DnsVpnService : VpnService() {
                 start()
             }
         }
+    }
+
+    private fun recordUpstreamResult(success: Boolean) {
+        if (!DEBUG_LOGS) return
+        val nowMs = System.currentTimeMillis()
+        if (upstreamWindowStartMs == 0L || nowMs - upstreamWindowStartMs >= DIAG_WINDOW_MS) {
+            // WHY: Reset window to keep the diagnostic failure rate time-bounded.
+            upstreamWindowStartMs = nowMs
+            upstreamWindowTotal.set(0)
+            upstreamWindowFailures.set(0)
+        }
+        upstreamWindowTotal.incrementAndGet()
+        if (success) {
+            lastUpstreamSuccessAtMs = nowMs
+        } else {
+            upstreamWindowFailures.incrementAndGet()
+        }
+    }
+
+    private fun logDiagnosticSnapshot(trigger: String) {
+        if (!DEBUG_LOGS) return
+        val nowMs = System.currentTimeMillis()
+        val net = currentNetwork
+        val netValidated = currentValidated
+        val lastPacketAgoMs = if (lastPacketAtMs > 0) nowMs - lastPacketAtMs else -1L
+        val lastUpstreamOkAgoMs = if (lastUpstreamSuccessAtMs > 0) nowMs - lastUpstreamSuccessAtMs else -1L
+        val lastUpstreamResetAgoMs = if (lastUpstreamResetAtMs > 0) nowMs - lastUpstreamResetAtMs else -1L
+        val windowAgeMs = if (upstreamWindowStartMs > 0) nowMs - upstreamWindowStartMs else -1L
+        val total = upstreamWindowTotal.get()
+        val failures = upstreamWindowFailures.get()
+        val failRate = if (total > 0) failures.toDouble() / total.toDouble() else 0.0
+        val requestQueueSize = requestQueue?.size ?: -1
+        val responseQueueSize = responseQueue?.size ?: -1
+        Log.i(
+            TAG,
+            "DIAG trigger=$trigger running=$isRunning net=$net validated=$netValidated " +
+                "lastPacketAgoMs=$lastPacketAgoMs lastUpstreamOkAgoMs=$lastUpstreamOkAgoMs " +
+                "lastUpstreamResetAgoMs=$lastUpstreamResetAgoMs windowAgeMs=$windowAgeMs " +
+                "upstreamTotal=$total upstreamFailures=$failures failRate=${"%.2f".format(failRate)} " +
+                "queues=request=$requestQueueSize/response=$responseQueueSize idle=$isIdleMode " +
+                "pendingReset=$pendingNetworkReset fatalStop=$fatalStopRequested"
+        )
     }
 
     private fun enqueueResponse(queue: BlockingQueue<ByteArray>, response: ByteArray) {
@@ -1028,12 +1104,15 @@ class DnsVpnService : VpnService() {
         val currentProcessor = processor ?: return
         val currentRequestQueue = requestQueue ?: return
         val currentResponseQueue = responseQueue ?: return
+        // WHY: Track reset timing to correlate with upstream failures in diagnostics.
+        lastUpstreamResetAtMs = System.currentTimeMillis()
         if (DEBUG_LOGS) {
             Log.d(
                 TAG,
                 "NET_RESET_EXECUTE current=$currentNetwork reqQ=${currentRequestQueue.size} " +
                     "respQ=${currentResponseQueue.size} sockets=${upstreamSockets.size}"
             )
+            logDiagnosticSnapshot("net_reset_execute")
         }
         synchronized(upstreamResetLock) {
             if (!isRunning || stopSignal.get()) return
@@ -1232,6 +1311,7 @@ class DnsVpnService : VpnService() {
         const val ACTION_START = "com.example.android_adblocker.action.START"
         const val ACTION_STOP = "com.example.android_adblocker.action.STOP"
         const val ACTION_RELOAD_RULES = "com.example.android_adblocker.action.RELOAD_RULES"
+        const val ACTION_DIAG = "com.example.android_adblocker.action.DIAG"
         const val NOTIFICATION_CHANNEL_ID = "adblocker_vpn"
         const val NOTIFICATION_ID = 1001
 
@@ -1243,7 +1323,7 @@ class DnsVpnService : VpnService() {
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
         private const val UPSTREAM_WORKER_COUNT = 2
-        private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 20
+        private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 5
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
@@ -1262,6 +1342,8 @@ class DnsVpnService : VpnService() {
         private const val REQUEST_QUEUE_WAIT_MS = 10L
         private const val NETWORK_IDLE_RESET_THRESHOLD_MS = 5000L
         private const val FATAL_RESTART_COOLDOWN_MS = 15000L
+        private const val DIAG_WINDOW_MS = 60_000L
+        private const val DIAG_FAILURE_SNAPSHOT_THRESHOLD = 3
         // WHY: Keep cache small and short-lived to reduce staleness and memory overhead.
         private const val DNS_CACHE_MAX_ENTRIES = 1024
         private const val DNS_CACHE_TTL_MS = 60000L
@@ -1329,6 +1411,12 @@ class DnsVpnService : VpnService() {
     @Volatile
     private var lastResponseEnqueueAtMs: Long = 0
     @Volatile
+    private var lastUpstreamSuccessAtMs: Long = 0
+    @Volatile
+    private var lastUpstreamResetAtMs: Long = 0
+    @Volatile
+    private var upstreamWindowStartMs: Long = 0
+    @Volatile
     private var pendingNetworkReset: Boolean = false
     @Volatile
     private var fatalStopRequested: Boolean = false
@@ -1339,6 +1427,8 @@ class DnsVpnService : VpnService() {
     private val servfailCount = AtomicInteger(0)
     private val responseDropCount = AtomicInteger(0)
     private val responseWriterStallCount = AtomicInteger(0)
+    private val upstreamWindowTotal = AtomicInteger(0)
+    private val upstreamWindowFailures = AtomicInteger(0)
     private val stopSignal = AtomicBoolean(false)
 }
 
