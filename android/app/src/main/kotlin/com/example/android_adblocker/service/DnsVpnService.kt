@@ -1322,8 +1322,8 @@ class DnsVpnService : VpnService() {
         private const val DNS_SERVER_INT = 0x0A000001
         private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
         private const val UPSTREAM_TIMEOUT_MS = 2000
-        private const val UPSTREAM_WORKER_COUNT = 2
-        private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 5
+        private const val UPSTREAM_WORKER_COUNT = 4
+        private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 3
         private const val UPSTREAM_QUEUE_CAPACITY = 512
         private const val RESPONSE_QUEUE_CAPACITY = 512
         private const val RESPONSE_DRAIN_MAX = 32
