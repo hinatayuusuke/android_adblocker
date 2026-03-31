@@ -10454,3 +10454,8 @@
 0.0.0.0 zantracker.com
 0.0.0.0 zeusclicks.com
 0.0.0.0 zion-telemetry.api.cnn.io
+# Manual additions (2026-03-31): recommended gaps found by comparing against maintained public blocklists.
+0.0.0.0 tapad.com
+0.0.0.0 scorecardresearch.com
+0.0.0.0 an.facebook.com
+0.0.0.0 log.byteoversea.com
