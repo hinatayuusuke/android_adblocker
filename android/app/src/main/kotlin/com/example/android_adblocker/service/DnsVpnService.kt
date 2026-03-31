@@ -33,6 +33,7 @@ import com.example.android_adblocker.core.DnsPacketProcessor
 import com.example.android_adblocker.core.DomainRuleMatcher
 import com.example.android_adblocker.data.BlocklistLoader
 import com.example.android_adblocker.data.VpnPreferences
+import com.example.android_adblocker.net.UpstreamEndpoint
 import com.example.android_adblocker.net.UpstreamResolver
 import java.io.FileDescriptor
 import java.io.FileInputStream
@@ -597,7 +598,7 @@ class DnsVpnService : VpnService() {
     ) {
         upstreamWorkers = sockets.mapIndexed { index, socket ->
             Thread {
-                val resolver = UpstreamResolver(socket, UPSTREAM_DNS, metrics)
+                val resolver = UpstreamResolver(socket, UPSTREAM_ENDPOINTS, UPSTREAM_TIMEOUT_MS, metrics)
                 var consecutiveFailures = 0
                 while (!stopSignal.get()) {
                     val job = try {
@@ -642,7 +643,8 @@ class DnsVpnService : VpnService() {
                             break
                         }
                     }
-                    val resolvedPayload = resolver.resolve(job.queryPayload)
+                    val resolveResult = resolver.resolve(job.queryPayload, job.query.id, job.query.question)
+                    val resolvedPayload = resolveResult as? UpstreamResolver.ResolveResult.Success
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1
                         recordUpstreamResult(success = false)
@@ -678,7 +680,7 @@ class DnsVpnService : VpnService() {
                             resolvedPayload.buffer,
                             resolvedPayload.length,
                             null,
-                            "upstream"
+                            "upstream_${resolvedPayload.endpointName}"
                         )
                         processor.buildUdpResponse(job.packetInfo, resolvedPayload.buffer, resolvedPayload.length)
                     }
@@ -1320,7 +1322,11 @@ class DnsVpnService : VpnService() {
         private const val VPN_ADDRESS = "10.0.0.2"
         private const val DNS_SERVER = "10.0.0.1"
         private const val DNS_SERVER_INT = 0x0A000001
-        private val UPSTREAM_DNS = InetSocketAddress("1.1.1.1", 53)
+        // WHY: Keep a secondary resolver so one upstream path timing out does not force SERVFAIL.
+        private val UPSTREAM_ENDPOINTS = listOf(
+            UpstreamEndpoint(InetSocketAddress("1.1.1.1", 53), "cloudflare"),
+            UpstreamEndpoint(InetSocketAddress("8.8.8.8", 53), "google")
+        )
         private const val UPSTREAM_TIMEOUT_MS = 2000
         private const val UPSTREAM_WORKER_COUNT = 4
         private const val UPSTREAM_FAILURE_RESET_THRESHOLD = 3
