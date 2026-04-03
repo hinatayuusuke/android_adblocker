@@ -606,91 +606,112 @@ class DnsVpnService : VpnService() {
                     } catch (_: InterruptedException) {
                         break
                     }
-                    val cacheKey = processor.cacheKey(job.query)
-                    val nowMs = System.currentTimeMillis()
-                    val cache = dnsCache
-                    if (cache != null) {
-                        val cachedPayload = cache.get(cacheKey, job.query.id, nowMs)
-                        if (cachedPayload != null) {
-                            val response = processor.buildUdpResponse(job.packetInfo, cachedPayload)
-                            enqueueResponse(responseQueue, response)
-                            continue
+                    try {
+                        val cacheKey = processor.cacheKey(job.query)
+                        val nowMs = System.currentTimeMillis()
+                        val cache = dnsCache
+                        if (cache != null) {
+                            val cachedPayload = cache.get(cacheKey, job.query.id, nowMs)
+                            if (cachedPayload != null) {
+                                val response = processor.buildUdpResponse(job.packetInfo, cachedPayload)
+                                enqueueResponse(responseQueue, response)
+                                continue
+                            }
                         }
-                    }
-                    updateIdleModeIfNeeded("upstream")
-                    if (isIdleMode) {
-                        if (requestQueue.size >= IDLE_QUEUE_DROP_THRESHOLD) {
-                            // WHY: Idle mode favors freshness over backlog on background traffic.
+                        updateIdleModeIfNeeded("upstream")
+                        if (isIdleMode) {
+                            if (requestQueue.size >= IDLE_QUEUE_DROP_THRESHOLD) {
+                                // WHY: Idle mode favors freshness over backlog on background traffic.
+                                val responsePayload = processor.buildServfailResponse(job.query)
+                                processor.logDnsResponse(
+                                    job.query,
+                                    responsePayload,
+                                    responsePayload.size,
+                                    DnsPacketProcessor.DNS_RCODE_SERVFAIL,
+                                    "servfail_idle"
+                                )
+                                val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
+                                enqueueResponse(responseQueue, response)
+                                if (DEBUG_LOGS) {
+                                    Log.d(TAG, "idle drop requestQueueSize=${requestQueue.size}")
+                                }
+                                continue
+                            }
+                            try {
+                                Thread.sleep(IDLE_UPSTREAM_DELAY_MS)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                                break
+                            }
+                        }
+                        val resolveResult = resolver.resolve(
+                            job.queryPayload,
+                            job.query.id,
+                            job.query.domain,
+                            job.query.qtype,
+                            job.query.qclass
+                        )
+                        val resolvedPayload = resolveResult as? UpstreamResolver.ResolveResult.Success
+                        if (resolvedPayload == null) {
+                            consecutiveFailures += 1
+                            recordUpstreamResult(success = false)
+                            if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
+                                // WHY: Detect stuck upstream and trigger a network reset recovery.
+                                consecutiveFailures = 0
+                                Log.w(TAG, "UPSTREAM_FAIL_RESET threshold hit -> schedule reset")
+                                scheduleNetworkReset()
+                            } else if (DEBUG_LOGS) {
+                                Log.d(TAG, "UPSTREAM_FAIL_COUNT worker=$index count=$consecutiveFailures")
+                                if (consecutiveFailures == DIAG_FAILURE_SNAPSHOT_THRESHOLD) {
+                                    logDiagnosticSnapshot("upstream_fail_threshold")
+                                }
+                            }
+                        } else {
+                            consecutiveFailures = 0
+                            recordUpstreamResult(success = true)
+                        }
+                        val response = if (resolvedPayload == null) {
                             val responsePayload = processor.buildServfailResponse(job.query)
                             processor.logDnsResponse(
                                 job.query,
                                 responsePayload,
                                 responsePayload.size,
                                 DnsPacketProcessor.DNS_RCODE_SERVFAIL,
-                                "servfail_idle"
+                                "servfail_upstream"
                             )
-                            val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
-                            enqueueResponse(responseQueue, response)
-                            if (DEBUG_LOGS) {
-                                Log.d(TAG, "idle drop requestQueueSize=${requestQueue.size}")
-                            }
-                            continue
+                            processor.buildUdpResponse(job.packetInfo, responsePayload)
+                        } else {
+                            cache?.put(cacheKey, resolvedPayload.buffer.copyOf(resolvedPayload.length), nowMs)
+                            processor.logDnsResponse(
+                                job.query,
+                                resolvedPayload.buffer,
+                                resolvedPayload.length,
+                                null,
+                                "upstream_${resolvedPayload.endpointName}"
+                            )
+                            processor.buildUdpResponse(job.packetInfo, resolvedPayload.buffer, resolvedPayload.length)
                         }
-                        try {
-                            Thread.sleep(IDLE_UPSTREAM_DELAY_MS)
-                        } catch (_: InterruptedException) {
+                        enqueueResponse(responseQueue, response)
+                    } catch (error: Throwable) {
+                        if (error is InterruptedException) {
                             Thread.currentThread().interrupt()
                             break
                         }
-                    }
-                    val resolveResult = resolver.resolve(
-                        job.queryPayload,
-                        job.query.id,
-                        job.query.domain,
-                        job.query.qtype,
-                        job.query.qclass
-                    )
-                    val resolvedPayload = resolveResult as? UpstreamResolver.ResolveResult.Success
-                    if (resolvedPayload == null) {
-                        consecutiveFailures += 1
-                        recordUpstreamResult(success = false)
-                        if (consecutiveFailures >= UPSTREAM_FAILURE_RESET_THRESHOLD) {
-                            // WHY: Detect stuck upstream and trigger a network reset recovery.
-                            consecutiveFailures = 0
-                            Log.w(TAG, "UPSTREAM_FAIL_RESET threshold hit -> schedule reset")
-                            scheduleNetworkReset()
-                        } else if (DEBUG_LOGS) {
-                            Log.d(TAG, "UPSTREAM_FAIL_COUNT worker=$index count=$consecutiveFailures")
-                            if (consecutiveFailures == DIAG_FAILURE_SNAPSHOT_THRESHOLD) {
-                                logDiagnosticSnapshot("upstream_fail_threshold")
-                            }
-                        }
-                    } else {
+                        Log.e(TAG, "UPSTREAM_WORKER_CRASH worker=$index", error)
                         consecutiveFailures = 0
-                        recordUpstreamResult(success = true)
-                    }
-                    val response = if (resolvedPayload == null) {
+                        recordUpstreamResult(success = false)
+                        scheduleNetworkReset()
                         val responsePayload = processor.buildServfailResponse(job.query)
                         processor.logDnsResponse(
                             job.query,
                             responsePayload,
                             responsePayload.size,
                             DnsPacketProcessor.DNS_RCODE_SERVFAIL,
-                            "servfail_upstream"
+                            "servfail_worker_error"
                         )
-                        processor.buildUdpResponse(job.packetInfo, responsePayload)
-                    } else {
-                        cache?.put(cacheKey, resolvedPayload.buffer.copyOf(resolvedPayload.length), nowMs)
-                        processor.logDnsResponse(
-                            job.query,
-                            resolvedPayload.buffer,
-                            resolvedPayload.length,
-                            null,
-                            "upstream_${resolvedPayload.endpointName}"
-                        )
-                        processor.buildUdpResponse(job.packetInfo, resolvedPayload.buffer, resolvedPayload.length)
+                        val response = processor.buildUdpResponse(job.packetInfo, responsePayload)
+                        enqueueResponse(responseQueue, response)
                     }
-                    enqueueResponse(responseQueue, response)
                 }
             }.apply {
                 name = "upstreamWorker#$index"

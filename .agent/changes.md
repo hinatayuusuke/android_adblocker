@@ -1897,3 +1897,36 @@
 
 ### Tests / Verification
 - verified each added domain appears exactly once in `android/app/src/main/assets/blocklist.txt`
+
+2026-04-04 00:42 (Asia/Taipei) — Fix upstream response validation and failover worker crash
+
+### Summary
+- relax upstream DNS response validation to semantic question matching and fix failover send crash on connected UDP sockets
+
+### Context / Goal
+- raw-byte question matching could discard valid DNS replies when question encoding differed despite matching semantics
+- failover reproduced a process crash with `IllegalArgumentException: connected address and packet address differ` from `upstreamWorker#3`
+
+### Changes
+- updated `UpstreamResolver` to validate replies by DNS ID plus normalized `QNAME/QTYPE/QCLASS`, including compressed-name parsing and finer mismatch reasons
+- aligned the reusable request `DatagramPacket` destination with the currently connected endpoint before send and handled `IllegalArgumentException` as an upstream failure
+- wrapped upstream worker query handling so unexpected throwables are logged, converted to `SERVFAIL`, and trigger reset recovery instead of crashing the process
+- documented the response-validation fix approach in `doc/UpstreamResponseValidationFixPlan.md`
+
+### Files Touched
+- `android/app/src/main/kotlin/com/example/android_adblocker/net/UpstreamResolver.kt` — replace raw question-byte comparison with semantic parsing, support name compression, and fix failover packet destination handling
+- `android/app/src/main/kotlin/com/example/android_adblocker/service/DnsVpnService.kt` — pass structured DNS query fields into the resolver and guard upstream workers from uncaught runtime exceptions
+- `doc/UpstreamResponseValidationFixPlan.md` — record the investigation, root cause hypothesis, and planned validation strategy
+
+### Behavioral Impact
+- valid upstream replies with equivalent question semantics are no longer discarded solely because their question bytes differ from the original query
+- failover between upstream endpoints no longer crashes the app when a connected socket reuses a packet that still points at the previous endpoint
+- unexpected upstream worker exceptions now degrade to logged `SERVFAIL` responses and reset recovery instead of terminating the app process
+
+### Risk & Mitigation
+- Risk: the new compressed-name parser could still reject malformed edge cases or accept cases that need tighter validation
+- Mitigation: pointer chasing is bounded, packet bounds are checked, mismatch reasons remain explicit, and build verification was rerun after the change
+
+### Tests / Verification
+- `android\\gradlew.bat app:compileDebugKotlin` with `JAVA_HOME=C:\\Program Files\\Microsoft\\jdk-17.0.17.10-hotspot`
+- reproduced-crash log review confirmed the original fatal path was `DatagramSocket.send()` during failover on `upstreamWorker#3`

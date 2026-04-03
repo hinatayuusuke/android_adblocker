@@ -89,6 +89,9 @@ internal class UpstreamResolver(
             ensureConnected(endpoint)
             metrics.onUpstreamSend()
             requestPacket.setData(query, 0, query.size)
+            // WHY: Some Android DatagramSocket implementations retain the previous packet destination
+            // across sends; keep the packet address aligned with the connected endpoint on failover.
+            requestPacket.setSocketAddress(endpoint.address)
             socket.send(requestPacket)
             val startNs = System.nanoTime()
             val attemptDeadlineAtMs = SystemClock.elapsedRealtime() + attemptTimeoutMs.toLong()
@@ -153,6 +156,15 @@ internal class UpstreamResolver(
                 )
             }
             return ResolveResult.Failure(endpoint.name, error)
+        } catch (error: IllegalArgumentException) {
+            metrics.onUpstreamFailure()
+            if (DEBUG_LOGS) {
+                Log.w(
+                    TAG,
+                    "UPSTREAM_FAIL endpoint=${endpoint.name} error=${error.javaClass.simpleName}:${error.message}"
+                )
+            }
+            return ResolveResult.Failure(endpoint.name, null)
         }
         return ResolveResult.Timeout(endpoint.name)
     }
