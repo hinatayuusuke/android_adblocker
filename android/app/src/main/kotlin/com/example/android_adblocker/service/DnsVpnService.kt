@@ -643,7 +643,13 @@ class DnsVpnService : VpnService() {
                             break
                         }
                     }
-                    val resolveResult = resolver.resolve(job.queryPayload, job.query.id, job.query.question)
+                    val resolveResult = resolver.resolve(
+                        job.queryPayload,
+                        job.query.id,
+                        job.query.domain,
+                        job.query.qtype,
+                        job.query.qclass
+                    )
                     val resolvedPayload = resolveResult as? UpstreamResolver.ResolveResult.Success
                     if (resolvedPayload == null) {
                         consecutiveFailures += 1

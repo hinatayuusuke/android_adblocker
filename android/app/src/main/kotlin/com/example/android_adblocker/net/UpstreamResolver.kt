@@ -29,7 +29,13 @@ internal class UpstreamResolver(
     private val responseView = ResolveResult.Success(responseBuffer, 0, "")
     private var connectedEndpoint: UpstreamEndpoint? = null
 
-    fun resolve(query: ByteArray, expectedQueryId: Int, expectedQuestion: ByteArray): ResolveResult {
+    fun resolve(
+        query: ByteArray,
+        expectedQueryId: Int,
+        expectedName: String,
+        expectedQtype: Int,
+        expectedQclass: Int
+    ): ResolveResult {
         if (upstreams.isEmpty()) {
             return ResolveResult.Failure("unconfigured", null)
         }
@@ -52,7 +58,9 @@ internal class UpstreamResolver(
                 endpoint = endpoint,
                 query = query,
                 expectedQueryId = expectedQueryId,
-                expectedQuestion = expectedQuestion,
+                expectedName = expectedName,
+                expectedQtype = expectedQtype,
+                expectedQclass = expectedQclass,
                 attemptTimeoutMs = attemptTimeoutMs
             )
             if (lastResult is ResolveResult.Success) {
@@ -72,7 +80,9 @@ internal class UpstreamResolver(
         endpoint: UpstreamEndpoint,
         query: ByteArray,
         expectedQueryId: Int,
-        expectedQuestion: ByteArray,
+        expectedName: String,
+        expectedQtype: Int,
+        expectedQclass: Int,
         attemptTimeoutMs: Int
     ): ResolveResult {
         try {
@@ -95,7 +105,9 @@ internal class UpstreamResolver(
                     payload = responseBuffer,
                     length = responsePacket.length,
                     expectedQueryId = expectedQueryId,
-                    expectedQuestion = expectedQuestion
+                    expectedName = expectedName,
+                    expectedQtype = expectedQtype,
+                    expectedQclass = expectedQclass
                 )
                 if (mismatch == null) {
                     if (DEBUG_LOGS) {
@@ -164,43 +176,100 @@ internal class UpstreamResolver(
         payload: ByteArray,
         length: Int,
         expectedQueryId: Int,
-        expectedQuestion: ByteArray
+        expectedName: String,
+        expectedQtype: Int,
+        expectedQclass: Int
     ): String? {
         if (length < DNS_HEADER_LEN) return "short_packet"
         val actualQueryId = readU16(payload, 0)
         if (actualQueryId != expectedQueryId) return "id_mismatch"
         val qdCount = readU16(payload, DNS_QDCOUNT_OFFSET)
         if (qdCount < 1) return "qdcount_missing"
-        val questionEnd = findQuestionEnd(payload, length) ?: return "question_parse"
-        val questionLength = questionEnd - DNS_HEADER_LEN
-        if (questionLength != expectedQuestion.size) return "question_mismatch"
-        for (index in expectedQuestion.indices) {
-            if (payload[DNS_HEADER_LEN + index] != expectedQuestion[index]) {
-                return "question_mismatch"
+        val question = parseQuestion(payload, length) ?: return "question_parse"
+        if (question.name != expectedName) return "question_name_mismatch"
+        if (question.qtype != expectedQtype) return "question_type_mismatch"
+        if (question.qclass != expectedQclass) return "question_class_mismatch"
+        return null
+    }
+
+    private fun parseQuestion(payload: ByteArray, length: Int): ParsedQuestion? {
+        val name = parseName(payload, DNS_HEADER_LEN, length) ?: return null
+        if (name.nextOffset + DNS_QUESTION_SUFFIX_LEN > length) return null
+        return ParsedQuestion(
+            name = name.value,
+            qtype = readU16(payload, name.nextOffset),
+            qclass = readU16(payload, name.nextOffset + 2)
+        )
+    }
+
+    private fun parseName(payload: ByteArray, offset: Int, length: Int): ParsedName? {
+        if (offset >= length) return null
+        val labels = StringBuilder()
+        var currentOffset = offset
+        var nextOffset = -1
+        var jumps = 0
+        while (currentOffset < length) {
+            val labelLength = payload[currentOffset].toInt() and 0xFF
+            when {
+                labelLength == 0 -> {
+                    if (nextOffset < 0) {
+                        nextOffset = currentOffset + 1
+                    }
+                    return ParsedName(labels.toString(), nextOffset)
+                }
+                (labelLength and DNS_POINTER_MASK) == DNS_POINTER_MASK -> {
+                    if (currentOffset + 1 >= length) return null
+                    if (nextOffset < 0) {
+                        nextOffset = currentOffset + 2
+                    }
+                    val pointer = ((labelLength and DNS_POINTER_VALUE_MASK) shl 8) or
+                        (payload[currentOffset + 1].toInt() and 0xFF)
+                    if (pointer >= length) return null
+                    currentOffset = pointer
+                    jumps += 1
+                    // WHY: Bound pointer chasing so malformed packets cannot loop forever.
+                    if (jumps > DNS_POINTER_MAX_JUMPS) return null
+                }
+                (labelLength and DNS_POINTER_MASK) != 0 -> return null
+                else -> {
+                    val labelStart = currentOffset + 1
+                    val labelEnd = labelStart + labelLength
+                    if (labelEnd > length) return null
+                    if (labels.isNotEmpty()) {
+                        labels.append('.')
+                    }
+                    appendLowercaseLabel(labels, payload, labelStart, labelLength)
+                    currentOffset = labelEnd
+                }
             }
         }
         return null
     }
 
-    private fun findQuestionEnd(payload: ByteArray, length: Int): Int? {
-        var index = DNS_HEADER_LEN
-        while (index < length) {
-            val labelLength = payload[index].toInt() and 0xFF
-            if (labelLength == 0) {
-                index += 1
-                break
+    private fun appendLowercaseLabel(
+        builder: StringBuilder,
+        payload: ByteArray,
+        offset: Int,
+        length: Int
+    ) {
+        for (index in 0 until length) {
+            val value = payload[offset + index].toInt() and 0xFF
+            val normalized = if (value in ASCII_UPPER_A..ASCII_UPPER_Z) {
+                value + ASCII_CASE_OFFSET
+            } else {
+                value
             }
-            if ((labelLength and DNS_POINTER_MASK) != 0) return null
-            index += 1 + labelLength
-            if (index > length) return null
+            builder.append(normalized.toChar())
         }
-        val questionEnd = index + DNS_QUESTION_SUFFIX_LEN
-        return if (questionEnd <= length) questionEnd else null
     }
 
     private fun readU16(payload: ByteArray, offset: Int): Int {
         return ((payload[offset].toInt() and 0xFF) shl 8) or (payload[offset + 1].toInt() and 0xFF)
     }
+
+    private data class ParsedName(val value: String, val nextOffset: Int)
+
+    private data class ParsedQuestion(val name: String, val qtype: Int, val qclass: Int)
 
     internal sealed class ResolveResult {
         class Success(
@@ -220,6 +289,11 @@ internal class UpstreamResolver(
         private const val DNS_QDCOUNT_OFFSET = 4
         private const val DNS_QUESTION_SUFFIX_LEN = 4
         private const val DNS_POINTER_MASK = 0xC0
+        private const val DNS_POINTER_VALUE_MASK = 0x3F
+        private const val DNS_POINTER_MAX_JUMPS = 16
+        private const val ASCII_UPPER_A = 0x41
+        private const val ASCII_UPPER_Z = 0x5A
+        private const val ASCII_CASE_OFFSET = 0x20
         private val DEBUG_LOGS = BuildConfig.DEBUG
     }
 }

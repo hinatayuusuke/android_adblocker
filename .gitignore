@@ -45,6 +45,6 @@ app.*.map.json
 /android/app/release
 
 #doc 
-doc/
-agents.md
+.doc/
 .serena/
+android/build/
